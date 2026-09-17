@@ -1,0 +1,922 @@
+// pktipv4.nv — the IPv4 header of RFC 791, with the option list walked
+// rather than stepped over.
+//
+// THREE LENGTHS, AND ONLY ONE OF THEM IS THE BUFFER'S
+//
+// An IPv4 header carries an internet header length in four-byte words
+// and a total length in bytes, and the span it was parsed out of has a
+// length of its own.  The three disagree in ordinary traffic and each
+// disagreement means something different:
+//
+//   * total length SHORTER than the span — the frame was padded to the
+//     sixty-byte Ethernet minimum, and the bytes past the total length
+//     are padding.  A parser that took the payload to the end of the
+//     span hands the padding to the application.
+//   * total length LONGER than the span — the capture's snapshot
+//     length cut the packet.  `PktTruncated`, and the recording is at
+//     fault rather than the packet.
+//   * header length longer than the total length — malformed.
+//     `PktBadLength`.
+//
+// `parse` narrows the payload to the total length, which is the only
+// one of the three that says where the datagram ends.
+//
+// TOTAL LENGTH ZERO IS NOT MALFORMED ON A LOCAL CAPTURE
+//
+// A host with segmentation offload hands the network card one large
+// buffer and lets the card cut it into datagrams.  A capture taken on
+// that host sees the buffer before the card has touched it, with a
+// total length of zero.  This is not rare: it is what tcpdump on a busy
+// server shows for most of its own outgoing traffic.  `parse` refuses
+// it, because a length of zero is not a length; `parse_offloaded` is
+// the entry point that accepts it and takes the payload to the end of
+// the span instead.  Two functions rather than a flag, so that a tool
+// reading a capture from a mirror port cannot silently accept a
+// zero-length datagram from the wire.
+//
+// THE OPTION LIST IS WHERE PARSERS LOOP FOREVER
+//
+// The option area is the bytes between the twenty-byte fixed header and
+// the header length.  Most options are a type byte, a length byte and
+// the data, with the length counting the type and length bytes
+// themselves — but two are not: end of option list (0) and no operation
+// (1) are ONE byte each and carry no length.  A walk that read a length
+// byte after a no-operation read the next option's type as its length.
+//
+// And a length byte of 0 or 1 on any other option makes the walk stand
+// still or step backwards, which is an infinite loop from a packet
+// anybody can send.  `options` refuses both with `PktBadOption`.
+//
+// THE TYPE BYTE IS THREE FIELDS
+//
+// RFC 791 section 3.1 splits the option type byte into a copied flag in
+// bit 7, a class in bits 6 and 5, and a number in bits 4 to 0.  Record
+// route is number 7, and a record route with the copied flag set
+// arrives as 0x87.  A program comparing the whole byte against 7 never
+// finds it.  `option_number` is what a filter compares.
+
+// An IPv4 header, as three spans into the caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.header.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIpv4
+    // The fixed header and the options: twenty bytes when the internet
+    // header length is 5, up to sixty when it is 15.
+    header: PktSpan
+    // The option area alone: the bytes between offset twenty and the
+    // end of the header.  Empty when the internet header length is 5,
+    // which is almost every datagram.
+    options: PktSpan
+    // The payload, narrowed to the total length.  What the transport
+    // header is parsed out of, and what the Ethernet padding is
+    // excluded from.
+    payload: PktSpan
+
+// One IPv4 option, as a span over the bytes it occupies.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIpv4Option
+    // The whole option: one byte for end of option list and no
+    // operation, and the type byte, the length byte and the data for
+    // every other.
+    span: PktSpan
+
+// Read an IPv4 header out of a span.
+//
+// Checks the version is 4, the internet header length is at least 5,
+// the header fits inside the total length, and the total length fits
+// inside the span.  `PktBadVersion`, `PktBadLength` and `PktTruncated`
+// are the three refusals in that order.  A total length of zero is
+// `PktBadLength`; `parse_offloaded` is the entry point that takes it.
+//
+// The payload is narrowed to the total length, so Ethernet padding is
+// not part of it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktIpv4, PktError>
+    todo("packet-nv.pktipv4.parse")
+
+// Read an IPv4 header, accepting a total length of zero.
+//
+// For a capture taken on the sending host, where segmentation offload
+// means the network card has not yet written the length.  A datagram
+// with a zero total length gets a payload running to the end of the
+// span; every other datagram parses exactly as `parse` parses it.
+//
+// A tool reading a capture from a mirror port or a tap uses `parse`,
+// because a zero total length from the wire is a malformed datagram and
+// accepting it silently loses that.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse_offloaded(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_offloaded(buf: Bytes, at: PktSpan) -> Result<PktIpv4, PktError>
+    todo("packet-nv.pktipv4.parse_offloaded")
+
+// Read an IPv4 header and refuse one whose checksum is wrong.
+//
+// `parse`, and then `PktBadChecksum` when the header checksum does not
+// match.  For a caller that wants a header or nothing; a caller that
+// wants to count bad checksums separately uses `parse` and
+// `verify_checksum`, which answers all four `PktChecksum` cases rather
+// than one refusal.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse_verified(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.header.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_verified(buf: Bytes, at: PktSpan) -> Result<PktIpv4, PktError>
+    todo("packet-nv.pktipv4.parse_verified")
+
+// The version nibble, which `parse` has already checked is 4.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.version(buf, h)
+//                 Ok(v)  => println("${v}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn version(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.version")
+
+// The header length in BYTES, not in the four-byte words the field
+// holds.
+//
+// The field is the internet header length of RFC 791 section 3.1 and
+// counts thirty-two-bit words; a header of 5 there is twenty bytes
+// here.  Multiplying is the commonest arithmetic mistake in an IPv4
+// parser, so it is done once, in this function.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.header_length(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn header_length(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.header_length")
+
+// The differentiated services code point: the top six bits of the
+// second byte (RFC 2474 section 3).
+//
+// The byte was the type of service of RFC 791 and was redefined; a tool
+// reading it as the old precedence field reports a class selector of 3
+// where the code point is 24.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.dscp(buf, h)
+//                 Ok(d)  => println("${d}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn dscp(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.dscp")
+
+// The explicit congestion notification bits: the low two bits of the
+// second byte (RFC 3168 section 5).
+//
+// 0 means the endpoints are not using it, 1 and 2 mean they are, and 3
+// means a router on the path marked the datagram instead of dropping
+// it.  A capture where the value is 3 is a capture of a congested path.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.ecn(buf, h)
+//                 Ok(e)  => println("${e}")
+//                 Err(x) => println(x.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ecn(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.ecn")
+
+// The total length: the header and the payload together, in bytes.
+//
+// Not the payload length, and not the frame length.  Zero on a capture
+// of an offloaded send; see `parse_offloaded`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.total_length(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn total_length(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.total_length")
+
+// The identification field: the number that groups the fragments of
+// one datagram.
+//
+// Unique per source, destination and protocol for as long as the
+// datagram might still be in the network (RFC 791 section 3.2).  A
+// reassembler keys on it together with those three; keying on it alone
+// joins fragments from different senders.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.identification(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn identification(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.identification")
+
+// The don't-fragment flag.
+//
+// Set on almost all modern TCP traffic, because that is how path MTU
+// discovery works: the sender forbids fragmentation and waits to be
+// told the datagram was too big.  A path where the resulting ICMP
+// messages are filtered is a path where connections hang after the
+// handshake, and a capture showing this flag set with no ICMP coming
+// back is what diagnoses it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.dont_fragment(buf, h)
+//                 Ok(f)  => println("${f}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn dont_fragment(buf: Bytes, h: PktIpv4) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv4.dont_fragment")
+
+// The more-fragments flag.
+//
+// Set on every fragment but the last.  Clear on an unfragmented
+// datagram AND on the last fragment, which is why it alone does not
+// answer whether a datagram is a fragment; see `is_fragment`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.more_fragments(buf, h)
+//                 Ok(f)  => println("${f}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn more_fragments(buf: Bytes, h: PktIpv4) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv4.more_fragments")
+
+// The fragment offset in BYTES.
+//
+// The field counts eight-byte units (RFC 791 section 3.1), so the value
+// read out of the packet is multiplied by eight here.  A reassembler
+// that forgot the multiplication places every fragment at an eighth of
+// its offset, which overlaps them all and produces a datagram of
+// plausible length and wrong content.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.fragment_offset(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn fragment_offset(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.fragment_offset")
+
+// Whether the datagram is a fragment of a larger one.
+//
+// True when the more-fragments flag is set OR the fragment offset is
+// non-zero.  Both are needed: the last fragment has the flag clear and
+// a non-zero offset, and a program testing only the flag treats it as a
+// whole datagram and parses the middle of a payload as a transport
+// header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.is_fragment(buf, h)
+//                 Ok(f)  => println("${f}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn is_fragment(buf: Bytes, h: PktIpv4) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv4.is_fragment")
+
+// Whether this fragment is the one carrying the transport header.
+//
+// True when the fragment offset is zero, whether or not more fragments
+// follow.  Only this fragment has the TCP or UDP header in it; a tool
+// that parsed a transport header out of any other fragment read
+// payload bytes as ports and sequence numbers, and got numbers that
+// looked like ports.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.has_transport_header(buf, h)
+//                 Ok(f)  => println("${f}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn has_transport_header(buf: Bytes, h: PktIpv4) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv4.has_transport_header")
+
+// The time to live.
+//
+// A hop count and not a time, despite the name.  Every router
+// decrements it and discards the datagram at zero, sending back an ICMP
+// time exceeded — which is what traceroute is built out of.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.ttl(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ttl(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.ttl")
+
+// What the payload is: TCP, UDP, ICMP or something else.
+//
+// The protocol field of RFC 791 section 3.1, which uses the same
+// numbering as IPv6's next header.  A fragment with a non-zero offset
+// still names its protocol, and still does not carry that protocol's
+// header; see `has_transport_header`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.protocol(buf, h)
+//                 Ok(p)  => println(pktproto.protocol_name(p))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn protocol(buf: Bytes, h: PktIpv4) -> Result<PktProtocol, PktError>
+    todo("packet-nv.pktipv4.protocol")
+
+// The header checksum as the packet carries it.
+//
+// The value in the field, not a verdict.  `verify_checksum` is what
+// compares it against the bytes.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.checksum(buf, h)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn checksum(buf: Bytes, h: PktIpv4) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.checksum")
+
+// The source address.
+//
+// TOTAL, AND NOT BY CHOICE.  `Ipv4` is a `@value` struct, which may be
+// neither a `Result` payload nor an option (SPEC section 14.5), so no
+// reason can travel back from here.  `parse` has already proved the
+// header fits the buffer it was given, so with that buffer this cannot
+// fail; called with a DIFFERENT buffer it answers the zero address.
+//
+// The answer is ipaddr-nv's own type, so a caller matching a datagram
+// against a configured prefix calls `Net4.contains` with it directly.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println(show.addr4(pktipv4.source(buf, h)))
+//         Err(e) => println(e.message())
+// ```
+pub fn source(buf: Bytes, h: PktIpv4) -> Ipv4
+    todo("packet-nv.pktipv4.source")
+
+// The destination address.
+//
+// Total, on the same terms as `source`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println(show.addr4(pktipv4.destination(buf, h)))
+//         Err(e) => println(e.message())
+// ```
+pub fn destination(buf: Bytes, h: PktIpv4) -> Ipv4
+    todo("packet-nv.pktipv4.destination")
+
+// The four bytes of the source address, as a span.
+//
+// For a caller that wants the bytes rather than the value — writing
+// them into another packet, hashing them into a flow key — and for one
+// that wants the read to be bounds-checked, which `source` cannot be.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv4.source_span(h).off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn source_span(h: PktIpv4) -> PktSpan
+    todo("packet-nv.pktipv4.source_span")
+
+// The four bytes of the destination address, as a span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv4.destination_span(h).off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn destination_span(h: PktIpv4) -> PktSpan
+    todo("packet-nv.pktipv4.destination_span")
+
+// The payload, narrowed to the total length.
+//
+// What the transport header is parsed out of.  Ethernet padding is not
+// in it, because the total length and not the frame says where the
+// datagram ends.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv4.payload(h).len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn payload(h: PktIpv4) -> PktSpan
+    todo("packet-nv.pktipv4.payload")
+
+// Walk the option area and answer every option in it.
+//
+// The walk: end of option list ends it, no operation advances one byte,
+// and every other option is a type byte, a length byte counting both of
+// them, and the data.  `PktBadOption` when a length byte is 0 or 1, or
+// when an option runs past the end of the header — the two shapes that
+// make a naive walk loop forever or read the next header.
+//
+// An empty option area answers an empty list, which is what almost
+// every datagram has.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn options(buf: Bytes, h: PktIpv4) -> Result<[PktIpv4Option], PktError>
+    todo("packet-nv.pktipv4.options")
+
+// The whole option type byte, copied flag and class and number
+// together.
+//
+// What is on the wire.  A filter comparing this against a number from
+// the registry misses every option whose copied flag is set;
+// `option_number` is the field to compare.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_kind(buf: Bytes, o: PktIpv4Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.option_kind")
+
+// The option number: bits 4 to 0 of the type byte (RFC 791 section
+// 3.1).
+//
+// 3 is loose source routing, 7 is record route, 9 is strict source
+// routing, 68 is the internet timestamp — and the first three of those
+// carry a list of addresses that a firewall usually has an opinion
+// about.  This is the field a filter compares.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_number(buf: Bytes, o: PktIpv4Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.option_number")
+
+// The option class: bits 6 and 5 of the type byte.
+//
+// 0 is control and 2 is debugging and measurement; 1 and 3 are
+// reserved.  The internet timestamp is the one option in class 2.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_class(buf: Bytes, o: PktIpv4Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.option_class")
+
+// The copied flag: bit 7 of the type byte.
+//
+// Set means a router fragmenting the datagram copies this option into
+// every fragment; clear means it goes in the first only.  Source
+// routing is copied, record route is not.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_is_copied(buf: Bytes, o: PktIpv4Option) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv4.option_is_copied")
+
+// The option's length in bytes, including the type and length bytes.
+//
+// 1 for end of option list and no operation, which carry no length
+// byte at all; the length byte's own value for everything else.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_length(buf: Bytes, o: PktIpv4Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv4.option_length")
+
+// The option's data: everything after the type and length bytes.
+//
+// Empty for end of option list and no operation.  An option this
+// package does not interpret keeps its bytes here rather than being
+// dropped, so a tool can show it and a rewriter can copy it forward.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.options(buf, h)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn option_data_span(buf: Bytes, o: PktIpv4Option) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktipv4.option_data_span")
+
+// The option's name: `"eool"`, `"nop"`, `"lsrr"`, `"rr"`, `"ssrr"`,
+// `"timestamp"`, `"router-alert"`, or the number.
+//
+// A pure function of the option number, for a display.
+//
+// ```novo
+// use pktipv4
+//
+// fn main() [io]
+//     println(pktipv4.option_name(7))
+// ```
+pub fn option_name(number: Int) -> Str
+    todo("packet-nv.pktipv4.option_name")
+
+// Verify the header checksum.
+//
+// The one's-complement sum over the header alone, with no
+// pseudo-header — RFC 791 section 3.1.  The payload is not covered, so
+// an IPv4 header can be valid on a datagram whose payload was
+// corrupted; that is what the transport checksums are for.
+//
+// `PktChecksumUnverifiable` when the header is not all present in the
+// buffer.  Never `PktChecksumAbsent`: a zero here is a wrong checksum.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+// use pktsum
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.verify_checksum(buf, h)
+//                 Ok(c)  => println(pktsum.checksum_reason(c))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_checksum(buf: Bytes, h: PktIpv4) -> Result<PktChecksum, PktError>
+    todo("packet-nv.pktipv4.verify_checksum")
+
+// Recompute the header checksum and write it into the buffer.
+//
+// For a tool that changed a field — a decremented time to live, a
+// rewritten address — and must leave the header consistent.  Answers
+// the buffer, which under this language's in-place rule is the same
+// buffer when the caller holds the only reference to it and rebinds
+// the same name.
+//
+// `pktsum.incremental_update` is the cheaper route when only a couple
+// of bytes changed and the old checksum was right.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+//
+// fn main() [io]
+//     var buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.set_checksum(buf, h)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn set_checksum(buf: Bytes, h: PktIpv4) -> Result<Bytes, PktError>
+    todo("packet-nv.pktipv4.set_checksum")
+
+// The pseudo-header for this datagram's transport checksum.
+//
+// Source, destination, protocol, and the upper-layer length — which is
+// the total length less the header length, and not the total length.
+// Building it from a parsed header is what stops a caller computing
+// that subtraction by hand and getting it wrong by the size of the
+// options.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv4
+// use pktsum
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pktipv4.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv4.pseudo(buf, h)
+//                 Ok(p)  => println("${pktsum.pseudo_length(p)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn pseudo(buf: Bytes, h: PktIpv4) -> Result<PktPseudo, PktError>
+    todo("packet-nv.pktipv4.pseudo")
+
+// Pad an option area to a multiple of four bytes with end-of-option
+// bytes.
+//
+// The internet header length counts thirty-two-bit words, so an option
+// area of six bytes cannot be expressed: it becomes eight, and RFC 791
+// section 3.1 says the padding is zeroes, which is the end-of-option
+// value.  `build` refuses an unpadded option area rather than padding
+// silently, because padding changes the header length and a caller
+// that computed one should be told its arithmetic was wrong.
+//
+// ```novo
+// use std.bytes
+// use pktipv4
+//
+// fn main() [io]
+//     println("${bytes.len(pktipv4.pad_options(bytes.zeros(6)))}")
+// ```
+pub fn pad_options(options: Bytes) -> Bytes
+    todo("packet-nv.pktipv4.pad_options")
+
+// Build an IPv4 datagram.
+//
+// Computes the header length from the option area, the total length
+// from the option area and the payload, and the header checksum from
+// both.  `PktBadLength` when the option area is not a multiple of four
+// bytes — `pad_options` is the fix — or longer than the forty bytes the
+// header length field can express.  `PktFieldOutOfRange` for a time to
+// live or an identification that does not fit its field.
+//
+// The fragment fields are zero: this builds a whole datagram.
+// Fragmenting one is the caller's, because the fragment size depends on
+// a path maximum transmission unit this package is not told.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktipv4
+// use pktproto
+//
+// fn main() [io]
+//     match pktipv4.build(PktProtoUdp, ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+//                         64, 4242, true, bytes.zeros(0), bytes.zeros(12))
+//         Ok(d)  => println("${bytes.len(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(protocol: PktProtocol, source: Ipv4, destination: Ipv4, ttl: Int, identification: Int,
+             dont_fragment: Bool, options: Bytes, payload: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pktipv4.build")

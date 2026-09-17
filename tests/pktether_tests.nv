@@ -1,0 +1,146 @@
+// pktether_tests.nv — the two ways the field after the addresses is
+// read, and the tag chain in front of it.
+//
+// RED ON PURPOSE.  What is asserted is that 1536 is the boundary
+// between a length and a type, that a tag stack moves the ethertype,
+// and that a builder refuses a VLAN identifier rather than masking it.
+
+use std.test
+use std.bytes
+use pktspan
+use pktether
+
+// A minimum-size frame: broadcast destination, a source address, an
+// IPv4 ethertype, and padding to sixty bytes.
+fn frame() -> Bytes
+    bytes.zeros(60)
+
+fn mac() -> Bytes
+    bytes.from_byte_list([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+
+@test
+fn test_1536_is_where_a_length_becomes_a_type() [io]
+    // IEEE 802.3 clause 3.2.6.  A frame whose field reads 0x0026 is an
+    // 802.3 frame of thirty-eight bytes, not a frame of ethertype 38.
+    test.case("0x0600 and above is a type")
+    test.assert(pktether.is_ethertype(0x0600))
+    test.assert(pktether.is_ethertype(0x0800))
+    test.assert(pktether.is_ethertype(0x86DD))
+
+    test.case("1500 and below is a length")
+    test.assert(not pktether.is_ethertype(38))
+    test.assert(not pktether.is_ethertype(1500))
+
+    test.case("`length_or_type` answers the raw field and decides nothing")
+    match pktether.parse(frame(), pktspan.whole(frame()))
+        Ok(e)  =>
+            match pktether.length_or_type(frame(), e)
+                Ok(v)  => test.assert(v >= 0)
+                Err(_) => test.fail("a sixty-byte frame has the field")
+        Err(_) => test.fail("sixty bytes is a whole minimum frame")
+
+    test.case("and `ethertype` refuses a frame whose field is a length")
+    match pktether.parse(frame(), pktspan.whole(frame()))
+        Ok(e)  =>
+            match pktether.ethertype(frame(), e)
+                Ok(_)                   => test.assert(true)
+                Err(PktBadLength(_, _)) => test.assert(true)
+                Err(_)                  => test.fail("only PktBadLength fits a length field")
+        Err(_) => test.fail("sixty bytes is a whole minimum frame")
+
+@test
+fn test_a_tag_stack_moves_the_ethertype_and_the_payload() [io]
+    // A parser assuming one tag reads the inner tag protocol
+    // identifier as an ethertype on every double-tagged frame.
+    test.case("no tags is a fourteen-byte header")
+    match pktether.parse(frame(), pktspan.whole(frame()))
+        Ok(e)  =>
+            test.assert(pktether.tag_count(e) == 0)
+            test.assert(e.header.len == 14)
+            test.assert(pktether.payload(e).off == 14)
+        Err(_) => test.fail("sixty bytes is a whole minimum frame")
+
+    test.case("the address spans are where they always are")
+    match pktether.parse(frame(), pktspan.whole(frame()))
+        Ok(e)  =>
+            test.assert(pktether.destination_span(e).off == 0)
+            test.assert(pktether.destination_span(e).len == 6)
+            test.assert(pktether.source_span(e).off == 6)
+        Err(_) => test.fail("sixty bytes is a whole minimum frame")
+
+    test.case("and asking for a tag that is not there is PktNoSuchLayer")
+    match pktether.parse(frame(), pktspan.whole(frame()))
+        Ok(e)  =>
+            match pktether.vlan(frame(), e, 0)
+                Ok(_)  => test.fail("an untagged frame has no tag 0")
+                Err(_) => test.assert(true)
+        Err(_) => test.fail("sixty bytes is a whole minimum frame")
+
+@test
+fn test_a_tag_is_four_fields_and_a_builder_refuses_a_bad_one() [io]
+    // Masking an identifier of 4096 into 0 builds a tag that means
+    // something else.
+    test.case("a well-formed tag is accepted")
+    match pktether.vlan_tag(0x8100, 5, false, 200)
+        Ok(t)  =>
+            test.assert(t.tpid == 0x8100)
+            test.assert(t.priority == 5)
+            test.assert(not t.drop_eligible)
+            test.assert(t.id == 200)
+        Err(_) => test.fail("priority 5 and identifier 200 are both in range")
+
+    test.case("4095 is reserved by IEEE 802.1Q and must not be transmitted")
+    match pktether.vlan_tag(0x8100, 0, false, 4095)
+        Ok(_)                            => test.fail("4095 is reserved")
+        Err(PktFieldOutOfRange(f, _, _)) => test.assert(f == "vlan_id")
+        Err(_)                           => test.fail("wrong reason for a reserved identifier")
+
+    test.case("and a priority above 7 does not fit three bits")
+    match pktether.vlan_tag(0x8100, 8, false, 100)
+        Ok(_)  => test.fail("a priority is three bits")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_address_predicates_read_the_first_byte() [io]
+    // The low bit of the first byte is the multicast bit (IEEE 802.3
+    // section 3.2.3), because that byte is transmitted first.
+    let b = bytes.from_byte_list([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+
+    test.case("broadcast is multicast with every other bit set too")
+    match pktether.is_broadcast(b, pktspan.whole(b))
+        Ok(v)  => test.assert(v)
+        Err(_) => test.fail("six bytes is an address")
+
+    match pktether.is_multicast(b, pktspan.whole(b))
+        Ok(v)  => test.assert(v)
+        Err(_) => test.fail("six bytes is an address")
+
+    test.case("and an address formats for a display")
+    match pktether.address_text(b, pktspan.whole(b))
+        Ok(s)  => test.assert(s == "ff:ff:ff:ff:ff:ff")
+        Err(_) => test.fail("six bytes is an address")
+
+@test
+fn test_building_a_frame_adds_no_padding() [io]
+    // A tool writing a capture file wants the frame it was given, not
+    // one this package extended.
+    test.case("a frame is fourteen bytes plus the payload")
+    match pktether.build(mac(), mac(), 0x0800, bytes.zeros(20))
+        Ok(f)  => test.assert(bytes.len(f) == 34)
+        Err(_) => test.fail("two six-byte addresses and a payload build a frame")
+
+    test.case("a tagged frame is four bytes longer per tag")
+    match pktether.vlan_tag(0x8100, 0, false, 42)
+        Ok(t)  =>
+            match pktether.build_tagged(mac(), mac(), [t], 0x0800, bytes.zeros(20))
+                Ok(f)  => test.assert(bytes.len(f) == 38)
+                Err(_) => test.fail("one tag adds four bytes")
+        Err(_) => test.fail("identifier 42 is in range")
+
+    test.case("and an address that is not six bytes is refused")
+    match pktether.build(bytes.zeros(4), mac(), 0x0800, bytes.zeros(20))
+        Ok(_)  => test.fail("an Ethernet address is six bytes")
+        Err(_) => test.assert(true)
+
+    test.case("`ethertype_name` never answers a blank")
+    test.assert(pktether.ethertype_name(0x0806) == "arp")

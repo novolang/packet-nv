@@ -1,0 +1,274 @@
+// pktudp.nv — the User Datagram Protocol of RFC 768, which is eight
+// bytes and two rules people get wrong.
+//
+// THE LENGTH FIELD INCLUDES THE HEADER
+//
+// The length is the datagram's, header included, so an eight-byte
+// length means an empty payload and a length below eight is malformed.
+// A parser that took the length as the payload length reads eight bytes
+// too many, which on a padded Ethernet frame is eight bytes of padding
+// and on a full frame is the start of whatever came next in the buffer.
+//
+// The field is also the second place the datagram's size is written:
+// the IP total length says it too, and the two can disagree.  When they
+// do, the IP header is the one to believe, because that is what the
+// routers used.  `parse` narrows to the UDP length and refuses one that
+// exceeds the span, so a disagreement is a refusal rather than a silent
+// choice.
+//
+// A ZERO CHECKSUM IS NOT A WRONG CHECKSUM
+//
+// RFC 768 makes the checksum optional over IPv4: a sender that did not
+// compute one writes zero, and a receiver must not check.  A great deal
+// of real traffic does this — tunnelling protocols, embedded telemetry,
+// some resolvers on a local segment — so a tool that reported a zero as
+// corruption would report a working network as broken.
+//
+// `PktChecksumAbsent` is that case and it is neither valid nor wrong.
+// Over IPv6 the rule reverses: RFC 8200 section 8.1 requires the
+// checksum, so a zero there is wrong, and `verify_checksum` decides
+// which rule applies from the pseudo-header it is given rather than
+// from a flag the caller might forget.
+//
+// AND A COMPUTED ZERO IS WRITTEN AS 0xFFFF
+//
+// If the sum comes out zero, a sender writes 0xFFFF instead, because
+// zero in the field means "no checksum".  The two are the same number
+// in one's-complement arithmetic, so it changes nothing about the check
+// and everything about what the field means.
+// `pktsum.udp_transmit_value` is the rule and `build` applies it.
+
+// A UDP header, as two spans into the caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  => println("${u.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktUdp
+    // The eight-byte header.  Always eight bytes: UDP has no options.
+    header: PktSpan
+    // The payload, narrowed to the length field less eight.
+    payload: PktSpan
+
+// Read a UDP header out of a span.
+//
+// Requires eight bytes, refuses a length field below 8 with
+// `PktBadLength`, and refuses a length longer than the span with
+// `PktTruncated`.  The payload is narrowed to the length less eight, so
+// Ethernet padding behind a short datagram is not part of it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  => println("${u.header.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktUdp, PktError>
+    todo("packet-nv.pktudp.parse")
+
+// The source port.
+//
+// Zero is legal and means the sender wants no reply — RFC 768's own
+// wording is that it is optional and a zero is used when no reply is
+// expected.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  =>
+//             match pktudp.source_port(buf, u)
+//                 Ok(p)  => println("${p}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn source_port(buf: Bytes, u: PktUdp) -> Result<Int, PktError>
+    todo("packet-nv.pktudp.source_port")
+
+// The destination port.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  =>
+//             match pktudp.destination_port(buf, u)
+//                 Ok(p)  => println("${p}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn destination_port(buf: Bytes, u: PktUdp) -> Result<Int, PktError>
+    todo("packet-nv.pktudp.destination_port")
+
+// The length field: the header AND the payload, in bytes.
+//
+// Eight means an empty payload.  Not the payload length, which is this
+// less eight, and `payload` is what answers that without the
+// subtraction.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  =>
+//             match pktudp.length(buf, u)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn length(buf: Bytes, u: PktUdp) -> Result<Int, PktError>
+    todo("packet-nv.pktudp.length")
+
+// The checksum as the header carries it.
+//
+// Zero means the sender computed none, over IPv4.  The value, not a
+// verdict; `verify_checksum` is the verdict.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  =>
+//             match pktudp.checksum(buf, u)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn checksum(buf: Bytes, u: PktUdp) -> Result<Int, PktError>
+    todo("packet-nv.pktudp.checksum")
+
+// The payload, narrowed to the length field less eight.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktudp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  => println("${pktudp.payload(u).len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn payload(u: PktUdp) -> PktSpan
+    todo("packet-nv.pktudp.payload")
+
+// Verify the checksum over the pseudo-header, the header and the
+// payload.
+//
+// THE FOUR ANSWERS, and which one comes back depends on the version the
+// pseudo-header names:
+//
+//   * `PktChecksumAbsent` for a carried zero over IPv4, where RFC 768
+//     makes the checksum optional;
+//   * `PktChecksumWrong` for a carried zero over IPv6, where RFC 8200
+//     section 8.1 requires it;
+//   * `PktChecksumUnverifiable` when the payload is not all present,
+//     which is every truncated capture and every locally captured
+//     offloaded send;
+//   * `PktChecksumValid` when the sums agree.
+//
+// The version comes from the pseudo-header rather than from a flag,
+// because the caller that built the pseudo-header had an IP header in
+// front of it and a flag is something to get wrong later.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktspan
+// use pktudp
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(20)
+//     let p = pktsum.pseudo_ipv4(ip.ipv4_zero(), ip.ipv4_zero(), PktProtoUdp, 20)
+//     match pktudp.parse(buf, pktspan.whole(buf))
+//         Ok(u)  =>
+//             match pktudp.verify_checksum(buf, u, p)
+//                 Ok(c)  => println(pktsum.checksum_reason(c))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_checksum(buf: Bytes, u: PktUdp, p: PktPseudo) -> Result<PktChecksum, PktError>
+    todo("packet-nv.pktudp.verify_checksum")
+
+// Build a UDP datagram with a checksum.
+//
+// Writes the length as eight plus the payload, computes the checksum
+// over the pseudo-header, and writes 0xFFFF when the sum comes out
+// zero.  `PktBadLength` for a payload longer than 65527 bytes, which is
+// the largest the sixteen-bit length field can describe beside the
+// header.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktudp
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+//                                PktProtoUdp, 12)
+//     match pktudp.build(5353, 5353, bytes.zeros(4), p)
+//         Ok(d)  => println("${bytes.len(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(source_port: Int, destination_port: Int, payload: Bytes,
+             p: PktPseudo) -> Result<Bytes, PktError>
+    todo("packet-nv.pktudp.build")
+
+// Build a UDP datagram with a zero checksum, for IPv4 only.
+//
+// Named so a reviewer can see it.  RFC 768 permits it over IPv4 and RFC
+// 8200 section 8.1 forbids it over IPv6, with the tunnelling case of
+// RFC 6935 the one exception, so the name says which version it is for
+// and the function takes no pseudo-header at all — there is nothing for
+// it to checksum.
+//
+// A datagram built this way has no end-to-end integrity check of any
+// kind, because IPv4's own checksum covers the header and not the
+// payload.  It is the right choice when the payload carries its own
+// integrity check and the wrong one otherwise.
+//
+// ```novo
+// use std.bytes
+// use pktudp
+//
+// fn main() [io]
+//     match pktudp.build_ipv4_without_checksum(5353, 5353, bytes.zeros(4))
+//         Ok(d)  => println("${bytes.len(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build_ipv4_without_checksum(source_port: Int, destination_port: Int,
+                                   payload: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pktudp.build_ipv4_without_checksum")

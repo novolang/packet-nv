@@ -1,0 +1,251 @@
+// pktipv6_tests.nv — the extension-header chain, which is where every
+// IPv6 parser goes wrong.
+//
+// RED ON PURPOSE.  The fixture is a forty-byte header whose
+// next-header byte names a hop-by-hop options header, which in turn
+// names UDP — the shape that makes `next_header` and `upper_layer`
+// different answers.
+
+use std.test
+use std.bytes
+use pktspan
+use pktipv6
+
+// An IPv6 header: version 6, payload length 16, next header 0
+// (hop-by-hop), hop limit 64, both addresses ::1 — followed by an
+// eight-byte hop-by-hop header naming UDP and an eight-byte UDP
+// header.
+fn datagram() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x40]),
+        bytes.zeros(15), bytes.from_byte_list([0x01]),
+        bytes.zeros(15), bytes.from_byte_list([0x01]),
+        bytes.from_byte_list([0x11, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00]),
+        bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00])])
+
+@test
+fn test_the_fixed_header_is_forty_bytes_and_says_nothing_about_the_transport() [io]
+    let d = datagram()
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("the fixed header is always forty bytes")
+            test.assert(h.header.len == 40)
+
+            test.case("the version is 6")
+            match pktipv6.version(d, h)
+                Ok(v)  => test.assert(v == 6)
+                Err(_) => test.fail("the fixture is IPv6")
+
+            test.case("the payload length INCLUDES the extension headers")
+            match pktipv6.payload_length(d, h)
+                Ok(n)  => test.assert(n == 16)
+                Err(_) => test.fail("the fixture says 16")
+            test.assert(pktipv6.payload(h).len == 16)
+
+            test.case("the hop limit is IPv6's name for the time to live")
+            match pktipv6.hop_limit(d, h)
+                Ok(n)  => test.assert(n == 64)
+                Err(_) => test.fail("the fixture says 64")
+
+            test.case("the traffic class spans a nibble boundary")
+            match pktipv6.traffic_class(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries zero")
+            match pktipv6.dscp(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries zero")
+            match pktipv6.ecn(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries zero")
+
+            test.case("and the flow label is chosen by the source, not computed")
+            match pktipv6.flow_label(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries zero")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_next_header_and_upper_layer_are_different_answers() [io]
+    // A parser that read the fixed header's byte as the transport
+    // protocol reports this datagram as carrying protocol 0.
+    let d = datagram()
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("the fixed header names the FIRST EXTENSION HEADER")
+            match pktipv6.next_header(d, h)
+                Ok(PktProtoIpv6HopByHop) => test.assert(true)
+                Ok(_)                    => test.fail("the fixture's next header is hop-by-hop")
+                Err(_)                   => test.fail("the fixture has a next-header byte")
+
+            test.case("and the chain ends at UDP")
+            match pktipv6.upper_layer(d, h)
+                Ok(PktProtoUdp) => test.assert(true)
+                Ok(_)           => test.fail("the chain ends at UDP")
+                Err(_)          => test.fail("the fixture's chain is walkable")
+
+            test.case("the upper-layer span starts past the chain")
+            match pktipv6.upper_layer_span(d, h)
+                Ok(s)  =>
+                    test.assert(s.off == 48)
+                    test.assert(s.len == 8)
+                Err(_) => test.fail("the fixture carries a UDP header")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_an_extension_header_does_not_say_what_it_is() [io]
+    // Its own first byte says what comes AFTER it.  So a header read
+    // out of the middle of a datagram cannot be identified at all,
+    // which is why the walk starts at the fixed header.
+    let d = datagram()
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            match pktipv6.extensions(d, h)
+                Ok(xs) =>
+                    test.case("the fixture has one extension header")
+                    test.assert(list.len(xs) == 1)
+
+                    test.case("whose kind came from the PREVIOUS header's byte")
+                    match list.first(xs)
+                        Some(x) =>
+                            test.assert(x.kind == 0)
+                            test.assert(pktipv6.ext_length(x) == 8)
+                            test.assert(pktipv6.ext_data_span(x).len == 6)
+                            match pktipv6.ext_kind(x)
+                                PktProtoIpv6HopByHop => test.assert(true)
+                                _                    => test.fail("kind 0 is hop-by-hop")
+                            match pktipv6.ext_next_header(d, x)
+                                Ok(PktProtoUdp) => test.assert(true)
+                                Ok(_)           => test.fail("its own byte names UDP")
+                                Err(_)          => test.fail("the header has a next-header byte")
+                        None    => test.fail("the fixture has one extension header")
+
+                Err(_) => test.fail("the fixture's chain is walkable")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_chain_is_bounded_and_the_option_action_is_in_the_option() [io]
+    // A chain of empty destination-options headers can be made as long
+    // as a datagram allows, and RFC 8200 sets no limit.
+    test.case("the walk has a bound and says what it is")
+    test.assert(pktipv6.extension_limit() > 0)
+
+    test.case("a hop-by-hop header's options carry their own unknown-option rule")
+    // RFC 8200 section 4.2: the top two bits say skip, discard,
+    // discard and report, or discard and report unless multicast.  A
+    // firewall that skipped every option it did not know would forward
+    // datagrams its operator told it to drop.
+    let d = datagram()
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            match pktipv6.extensions(d, h)
+                Ok(xs) =>
+                    match list.first(xs)
+                        Some(x) =>
+                            match pktipv6.ext_options(d, x)
+                                Ok(os) =>
+                                    match list.first(os)
+                                        Some(o) =>
+                                            match pktipv6.ipv6_option_type(d, o)
+                                                Ok(t)  => test.assert(t == 1)
+                                                Err(_) => test.fail("PadN is option type 1")
+                                            match pktipv6.ipv6_option_action(d, o)
+                                                Ok(a)  => test.assert(a == 0)
+                                                Err(_) => test.fail("PadN's action bits are skip")
+                                            match pktipv6.ipv6_option_length(d, o)
+                                                Ok(n)  => test.assert(n == 6)
+                                                Err(_) => test.fail("the fixture's PadN is six bytes")
+                                            match pktipv6.ipv6_option_data_span(d, o)
+                                                Ok(s)  => test.assert(s.len == 4)
+                                                Err(_) => test.fail("PadN carries its padding")
+                                        None    => test.fail("the fixture's hop-by-hop carries one option")
+                                Err(_) => test.fail("a hop-by-hop header has TLV options")
+                        None    => test.fail("the fixture has one extension header")
+                Err(_) => test.fail("the fixture's chain is walkable")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_fragment_header_has_its_own_length_rule() [io]
+    // It is fixed at eight bytes and its second byte is RESERVED (RFC
+    // 8200 section 4.5).  A walker applying the general formula gets
+    // eight only while that byte happens to be zero.
+    let frag = bytes.concat([
+        bytes.from_byte_list([0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 0x2C, 0x40]),
+        bytes.zeros(15), bytes.from_byte_list([0x01]),
+        bytes.zeros(15), bytes.from_byte_list([0x01]),
+        bytes.from_byte_list([0x11, 0xFF, 0x00, 0x09, 0x00, 0x00, 0x30, 0x39]),
+        bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00])])
+
+    test.case("the reserved byte is 0xFF and the header is still eight bytes")
+    match pktipv6.parse(frag, pktspan.whole(frag))
+        Ok(h)  =>
+            match pktipv6.extensions(frag, h)
+                Ok(xs) =>
+                    match list.first(xs)
+                        Some(x) =>
+                            test.assert(pktipv6.ext_length(x) == 8)
+
+                            test.case("the offset is in BYTES, as IPv4's is")
+                            match pktipv6.fragment_offset(frag, x)
+                                Ok(n)  => test.assert(n == 8)
+                                Err(_) => test.fail("offset field 1 is eight bytes")
+
+                            test.case("more-fragments is the low bit")
+                            match pktipv6.fragment_more(frag, x)
+                                Ok(f)  => test.assert(f)
+                                Err(_) => test.fail("the fixture sets it")
+
+                            test.case("and the identification is thirty-two bits")
+                            match pktipv6.fragment_identification(frag, x)
+                                Ok(n)  => test.assert(n == 0x3039)
+                                Err(_) => test.fail("the fixture carries one")
+
+                            test.case("a routing field on a fragment header is PktNoSuchLayer")
+                            match pktipv6.routing_type(frag, x)
+                                Ok(_)  => test.fail("a fragment header has no routing type")
+                                Err(_) => test.assert(true)
+                            match pktipv6.routing_segments_left(frag, x)
+                                Ok(_)  => test.fail("a fragment header has no segments left")
+                                Err(_) => test.assert(true)
+
+                        None    => test.fail("the fixture has one extension header")
+
+                Err(_) => test.fail("the fixture's chain is walkable")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_addresses_and_the_spans() [io]
+    let d = datagram()
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("the source is ::1")
+            test.assert(pktipv6.source(d, h).is_loopback())
+
+            test.case("and so is the destination")
+            test.assert(pktipv6.destination(d, h).is_loopback())
+
+            test.case("both are sixteen bytes, at the offsets RFC 8200 section 3 gives")
+            test.assert(pktipv6.source_span(h).off == 8)
+            test.assert(pktipv6.source_span(h).len == 16)
+            test.assert(pktipv6.destination_span(h).off == 24)
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_a_zero_payload_length_is_a_jumbogram_or_an_offloaded_send() [io]
+    // Not an empty datagram.  RFC 2675 puts a jumbogram's real length
+    // in a hop-by-hop option.
+    let d = bytes.set_u16_be(datagram(), 4, 0)
+
+    test.case("`parse` refuses it")
+    match pktipv6.parse(d, pktspan.whole(d))
+        Ok(_)  => test.fail("zero is not a payload length")
+        Err(_) => test.assert(true)
+
+    test.case("and `parse_offloaded` takes it")
+    match pktipv6.parse_offloaded(d, pktspan.whole(d))
+        Ok(h)  => test.assert(h.payload.len == 16)
+        Err(_) => test.fail("a jumbogram's fixed header is readable")

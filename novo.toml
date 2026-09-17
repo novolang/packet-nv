@@ -1,0 +1,48 @@
+[package]
+name        = "packet-nv"
+version     = "0.0.1"
+description = "Ethernet, ARP, IPv4, IPv6, ICMP, ICMPv6, TCP and UDP headers read as spans over bytes the caller already holds — an offset and a length, never a copy — with the IPv4 option list and the IPv6 extension-header chain walked rather than skipped, the TCP options decoded, and every checksum computed and verified over its pseudo-header.  The analysis half of a protocol stack, with no sockets and no reassembly."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  The bytes arrive from somewhere else and this package never
+# goes and gets them: a capture file read by pcapfile-nv, a datagram a
+# `[net]` caller already received, a fixture in a test.  A parse hands
+# back an offset and a length into the buffer it was given, so nothing
+# here allocates per packet and nothing here performs anything — no
+# socket, no clock, no file.  The one function that copies is
+# `pktspan.bytes_of`, and it is named so a reader can see where the
+# allocation is.  A capture is walked at a million packets a second by
+# a program whose only heap traffic is the caller's own buffer.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["packet", "ethernet", "arp", "ipv4", "ipv6", "icmp", "tcp", "udp", "checksum", "vlan", "pcap", "networking"]
+repository  = "https://github.com/novolang/packet-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Protocol headers as spans over the caller's bytes"
+
+[dependencies]
+# ipaddr-nv supplies `Ipv4` and `Ipv6`.  An address parsed out of a
+# header is that package's own value type, so a caller comparing a
+# datagram's source to a configured prefix hands it straight to
+# `Net4.contains` instead of re-encoding it through bytes and parsing
+# it back.  `ip.ipv4_from_bytes(buf, off)` and `ip.ipv6_from_bytes`
+# read one out of a buffer at an offset, which is exactly the shape a
+# span-based parse needs.  Both are `@value` structs that live on the
+# stack, so an address accessor costs no allocation either.  `core`,
+# so the layer rule holds.
+ipaddr-nv = "^0.1"

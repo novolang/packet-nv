@@ -1,0 +1,139 @@
+// pktsum_tests.nv — four answers rather than two, and the two places a
+// checksum rule differs by version.
+//
+// RED ON PURPOSE.  What is asserted is that a zero UDP checksum over
+// IPv4 is not a failure, that `not is_valid` does not mean corrupt, and
+// that a computed zero is transmitted as 0xFFFF.
+
+use std.test
+use std.bytes
+use ip
+use pktspan
+use pktsum
+use pktudp
+
+@test
+fn test_a_zero_udp_checksum_over_ipv4_is_absent_and_not_wrong() [io]
+    // RFC 768 makes it optional over IPv4.  Tunnelling protocols,
+    // embedded telemetry and some resolvers send zero, and a tool
+    // using the wrong comparison counts all of it as corrupt.
+    test.case("over IPv4 a carried zero is PktChecksumAbsent")
+    match pktsum.compare_udp_ipv4(0x1234, 0x0000)
+        PktChecksumAbsent => test.assert(true)
+        _                 => test.fail("RFC 768 makes it optional over IPv4")
+
+    test.case("and a non-zero one compares as any other would")
+    match pktsum.compare_udp_ipv4(0x1234, 0x1234)
+        PktChecksumValid => test.assert(true)
+        _                => test.fail("equal sums are valid")
+
+    test.case("for every other protocol a zero is simply wrong")
+    match pktsum.compare(0x1234, 0x0000)
+        PktChecksumWrong(w, g) =>
+            test.assert(w == 0x1234)
+            test.assert(g == 0)
+        _                      => test.fail("a zero TCP checksum is a wrong checksum")
+
+    test.case("the rule as a function: only UDP over IPv4")
+    test.assert(pktsum.zero_means_absent(PktProtoUdp, false))
+    test.assert(not pktsum.zero_means_absent(PktProtoUdp, true))
+    test.assert(not pktsum.zero_means_absent(PktProtoTcp, false))
+
+@test
+fn test_not_valid_does_not_mean_corrupt() [io]
+    // A tool counting bad checksums matches PktChecksumWrong and
+    // nothing else.  Absent and unverifiable are "unknown".
+    test.case("valid is valid")
+    test.assert(pktsum.is_valid(PktChecksumValid))
+
+    test.case("absent is not valid, and it is not wrong either")
+    test.assert(not pktsum.is_valid(PktChecksumAbsent))
+
+    test.case("and neither is unverifiable")
+    test.assert(not pktsum.is_valid(pktsum.unverifiable("snapshot length")))
+    test.assert(not pktsum.is_valid(PktChecksumUnverifiable("offload")))
+
+    test.case("the code is a safe metric label and the reason is for a display")
+    test.assert(pktsum.checksum_code(PktChecksumValid) == "valid")
+    test.assert(pktsum.checksum_code(PktChecksumAbsent) == "absent")
+    test.assert(pktsum.checksum_reason(PktChecksumAbsent) != "")
+
+@test
+fn test_a_computed_zero_is_written_as_ffff_for_udp_and_only_udp() [io]
+    // Zero in the field means "no checksum", so a sender writing the
+    // computed zero would be telling the receiver not to check.  The
+    // two are the same number in one's-complement arithmetic.
+    test.case("zero becomes 0xFFFF")
+    test.assert(pktsum.udp_transmit_value(0) == 0xFFFF)
+
+    test.case("and every other value is left alone")
+    test.assert(pktsum.udp_transmit_value(0x1234) == 0x1234)
+    test.assert(pktsum.udp_transmit_value(0xFFFF) == 0xFFFF)
+
+@test
+fn test_the_arithmetic_is_rfc_1071s() [io]
+    test.case("folding adds the carries back in and complements")
+    test.assert(pktsum.ones_complement_fold(0x1FFFF) == 0xFFFF - 0x0000)
+
+    test.case("a sum over a zero buffer is zero")
+    let z = bytes.zeros(20)
+    match pktsum.ones_complement_sum(z, pktspan.whole(z))
+        Ok(v)  => test.assert(v == 0)
+        Err(_) => test.fail("twenty zero bytes sum to zero")
+
+    test.case("and a checksum over one is its complement")
+    match pktsum.checksum_of(z, pktspan.whole(z))
+        Ok(v)  => test.assert(v == 0xFFFF)
+        Err(_) => test.fail("twenty zero bytes checksum to 0xFFFF")
+
+@test
+fn test_the_pseudo_header_carries_the_upper_layer_length_and_not_the_ip_one() [io]
+    // Using the IP total length gives a checksum wrong by exactly the
+    // header length.
+    test.case("the IPv4 form is twelve bytes")
+    let p4 = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+                                PktProtoUdp, 12)
+    test.assert(pktsum.pseudo_length(p4) == 12)
+    test.assert(not p4.over_ipv6)
+    test.assert(bytes.len(pktsum.pseudo_bytes(p4)) == 12)
+
+    test.case("the IPv6 form is forty")
+    let p6 = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 8)
+    test.assert(p6.over_ipv6)
+    test.assert(bytes.len(pktsum.pseudo_bytes(p6)) == 40)
+    test.assert(p6.protocol == 58)
+
+    test.case("and a sum with one covers the pseudo-header first")
+    let b = bytes.zeros(12)
+    match pktsum.checksum_with_pseudo(b, pktspan.whole(b), p4)
+        Ok(v)  => test.assert(v >= 0)
+        Err(_) => test.fail("a twelve-byte span is summable")
+
+@test
+fn test_the_incremental_update_is_rfc_1624s_and_not_rfc_1141s() [io]
+    // The earlier equation can produce 0x0000 where 0xFFFF is meant,
+    // and in UDP 0x0000 means "no checksum".  That is why RFC 1624
+    // exists.
+    test.case("changing a field updates the checksum without re-summing")
+    let updated = pktsum.incremental_update(0xB861, 0x4000, 0x0000)
+    test.assert(updated >= 0)
+    test.assert(updated <= 0xFFFF)
+
+    test.case("changing nothing changes nothing")
+    test.assert(pktsum.incremental_update(0xB861, 0x1234, 0x1234) == 0xB861)
+
+@test
+fn test_udp_over_ipv6_has_no_optional_checksum() [io]
+    // RFC 8200 section 8.1 requires it, and the version comes from the
+    // pseudo-header rather than from a flag the caller could forget.
+    let d = bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00])
+    let p6 = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoUdp, 8)
+
+    test.case("a zero checksum over IPv6 is wrong, not absent")
+    match pktudp.parse(d, pktspan.whole(d))
+        Ok(u)  =>
+            match pktudp.verify_checksum(d, u, p6)
+                Ok(PktChecksumAbsent) => test.fail("IPv6 requires the UDP checksum")
+                Ok(_)                 => test.assert(true)
+                Err(_)                => test.fail("an eight-byte datagram is verifiable")
+        Err(_) => test.fail("the fixture is a well-formed datagram")

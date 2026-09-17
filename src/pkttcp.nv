@@ -1,0 +1,862 @@
+// pkttcp.nv — the TCP header of RFC 9293, with the options decoded.
+//
+// WHAT A SEQUENCE NUMBER ADVANCES BY
+//
+// The single most useful thing a tool computes from a TCP header is how
+// far the sequence number moves, and it is not the payload length.  A
+// SYN counts as one byte and a FIN counts as one byte, so a handshake's
+// first segment carries no data and still advances the sequence space
+// by one.  A tool that used the payload length has every connection's
+// sequence numbers off by one from the handshake onwards, and reports
+// the first data segment as a retransmission.  `segment_length` is that
+// number and it is the function most callers want.
+//
+// THE WINDOW IS SCALED, AND NOT ALWAYS
+//
+// RFC 7323 section 2 lets each end announce a left shift for its
+// receive window, in a SYN option.  The shift applies to every
+// subsequent segment IN THE OTHER DIRECTION and to no segment of the
+// handshake, including the SYN that announced it.
+//
+// So there are three ways to get this wrong and each produces a
+// plausible number.  Scaling the SYN's own window reports a window
+// sixty-four or a hundred and twenty-eight times too large on the first
+// segment.  Not scaling afterwards reports a window that never grows
+// past 65535 and makes every fast connection look throttled.  Using the
+// sender's own shift rather than the peer's scales by the wrong amount
+// entirely.  `scaled_window` is a pure function of a window and a
+// shift, and its documentation says which shift and which segments;
+// this package cannot apply it for the caller, because doing so needs
+// the connection's state and this package holds none.
+//
+// THE OPTION WALK
+//
+// Options run from the twenty-byte fixed header to the data offset.
+// End of option list (0) and no operation (1) are ONE byte each and
+// carry no length; every other option is a kind byte, a length byte
+// counting both, and the data.  A length of 0 or 1 makes a walk stand
+// still or step backwards, and that is an infinite loop from a segment
+// anybody can send.  `options` refuses it with `PktBadOption`.
+//
+// An option this package does not know is kept whole.  Its kind, its
+// length and its data span are all available, so a tool can display it
+// and a rewriter can copy it forward, and a new option does not need
+// this package to be updated before traffic using it can be read.
+//
+// NO STREAM REASSEMBLY
+//
+// There is no reassembly here, and that is a boundary rather than an
+// omission.  Reassembling a stream needs a table of connections, a
+// reorder buffer per direction, a policy for overlapping segments —
+// which differs between operating systems and is a way to evade an
+// intrusion detector — and a timeout for a flow that stops.  All of it
+// is state with a lifetime the caller owns.  This module reads one
+// segment.
+
+// A TCP header, as three spans into the caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  => println("${t.header.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktTcp
+    // The fixed header and the options: twenty bytes when the data
+    // offset is 5, up to sixty when it is 15.
+    header: PktSpan
+    // The option area alone: the bytes between offset twenty and the
+    // data offset.  Empty when the data offset is 5, which is most
+    // segments after the handshake on a connection using no options.
+    options: PktSpan
+    // The payload.  Empty on a pure acknowledgement, which is a large
+    // share of the segments on any connection.
+    payload: PktSpan
+
+// One TCP option, as a span over the bytes it occupies.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct PktTcpOption
+    // The whole option: one byte for end of option list and no
+    // operation, and the kind byte, the length byte and the data for
+    // every other.
+    span: PktSpan
+
+// One selective acknowledgement block: a range of sequence numbers the
+// receiver already has.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println("a SACK block is a half-open range of sequence numbers")
+// ```
+pub struct PktTcpSack
+    // The first sequence number of the range.
+    left: Int
+    // One past the last sequence number of the range.  The range is
+    // half-open, as RFC 2018 section 3 defines it, so a block of
+    // [1000, 2000) acknowledges a thousand bytes and not a thousand and
+    // one.
+    right: Int
+
+// One of the eight control bits in the TCP header.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println("${pkttcp.has(0x12, PktTcpSyn)}")
+// ```
+pub enum PktTcpFlag
+    // The sender has no more data.  Counts as one byte of sequence
+    // space.
+    PktTcpFin
+    // Synchronise sequence numbers: the first segment of each
+    // direction of a connection.  Counts as one byte of sequence
+    // space.
+    PktTcpSyn
+    // Reset the connection.  A segment with this set carries no
+    // reliable sequence number and is not acknowledged.
+    PktTcpRst
+    // Push: deliver what has arrived without waiting for more.  An
+    // advisory bit, and most stacks set it on the last segment of a
+    // write.
+    PktTcpPsh
+    // The acknowledgement field is meaningful.  Set on every segment
+    // of a connection except the first SYN, which is why an
+    // acknowledgement number read off a SYN is meaningless.
+    PktTcpAck
+    // The urgent pointer field is meaningful.  Rare, inconsistently
+    // implemented, and a long-standing source of evasion against
+    // intrusion detectors that interpret it differently from the
+    // receiving host.
+    PktTcpUrg
+    // ECN-echo: the peer saw a congestion mark and is telling the
+    // sender (RFC 3168 section 6.1).
+    PktTcpEce
+    // Congestion window reduced: the sender acted on an ECN-echo (RFC
+    // 3168 section 6.1).
+    PktTcpCwr
+
+// Read a TCP header out of a span.
+//
+// Checks that twenty bytes are present, that the data offset is at
+// least 5, and that the header the data offset implies fits inside the
+// span.  `PktTruncated` and `PktBadLength` are the two refusals.
+//
+// The payload is whatever the span holds past the header — so the span
+// must already be narrowed to the IP total length, which
+// `pktipv4.payload` and `pktipv6.upper_layer_span` both are.  Handing
+// this a span that runs to the end of an Ethernet frame gives a payload
+// with the frame padding in it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  => println("${t.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktTcp, PktError>
+    todo("packet-nv.pkttcp.parse")
+
+// The source port.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.source_port(buf, t)
+//                 Ok(p)  => println("${p}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn source_port(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.source_port")
+
+// The destination port.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.destination_port(buf, t)
+//                 Ok(p)  => println("${p}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn destination_port(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.destination_port")
+
+// The sequence number of the first byte of the payload.
+//
+// On a SYN it is the initial sequence number, and the first data byte
+// is at that number plus one, because the SYN itself occupies one.
+// The number wraps at thirty-two bits, so comparing two of them with
+// `<` is wrong across a wrap; RFC 9293 section 3.4 defines the modular
+// comparison.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.sequence(buf, t)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sequence(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.sequence")
+
+// The acknowledgement number: the next sequence number the sender
+// expects.
+//
+// Meaningful only when the ACK flag is set, which is every segment
+// except the first SYN.  A tool that read it off a SYN read whatever
+// the sender left in the field.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.acknowledgement(buf, t)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn acknowledgement(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.acknowledgement")
+
+// The header length in BYTES.
+//
+// The data offset field counts thirty-two-bit words, so a value of 5
+// there is twenty bytes here.  Multiplying is done once, in this
+// function.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.data_offset(buf, t)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn data_offset(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.data_offset")
+
+// The eight control bits, as one value.
+//
+// `has` is what reads one out of it.  Answering the byte rather than
+// eight booleans keeps a flow table's per-segment record one number
+// wide and lets a filter compare a mask in one operation.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.flags(buf, t)
+//                 Ok(f)  => println(pkttcp.flag_names(f))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn flags(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.flags")
+
+// Whether a flags value has a particular bit set.
+//
+// A pure function of the number, so it works on a value stored in a
+// flow table long after the buffer is gone.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println("${pkttcp.has(0x02, PktTcpSyn)}")
+//     println("${pkttcp.has(0x02, PktTcpAck)}")
+// ```
+pub fn has(flags: Int, flag: PktTcpFlag) -> Bool
+    todo("packet-nv.pkttcp.has")
+
+// The set bits as the conventional letters, in the conventional order:
+// `"SYN,ACK"`, `"FIN,ACK"`, `"RST"`, or `""` for no bits at all.
+//
+// For a display.  The order is the one tcpdump and Wireshark print, so
+// a capture summary from this package can be compared with theirs line
+// by line.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println(pkttcp.flag_names(0x12))
+// ```
+pub fn flag_names(flags: Int) -> Str
+    todo("packet-nv.pkttcp.flag_names")
+
+// The receive window as the header carries it, UNSCALED.
+//
+// The raw sixteen-bit field.  On a connection that negotiated window
+// scaling the real window is this shifted left by the PEER's announced
+// shift, and `scaled_window` is the function that does it — this one
+// deliberately does not, because applying the shift needs the
+// connection's handshake and this package holds no connection state.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.window(buf, t)
+//                 Ok(w)  => println("${w}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn window(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.window")
+
+// A window with a scale applied.
+//
+// `window << shift`.  RFC 7323 section 2.2's rule, and the two halves
+// of it that a caller must supply correctly:
+//
+//  1. the shift is the one the PEER announced in its SYN, not the one
+//     this sender announced;
+//  2. it applies to every segment AFTER the handshake and to no segment
+//     of it, including the SYN that carried the option.
+//
+// A pure function, so a flow tracker applies it when it has both halves
+// and never before.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println("${pkttcp.scaled_window(501, 7)}")
+// ```
+pub fn scaled_window(window: Int, shift: Int) -> Int
+    todo("packet-nv.pkttcp.scaled_window")
+
+// The checksum as the header carries it.
+//
+// The value in the field, not a verdict.  `verify_checksum` compares
+// it against the bytes.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.checksum(buf, t)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn checksum(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.checksum")
+
+// The urgent pointer.
+//
+// Meaningful only when the URG flag is set, and even then its meaning
+// is contested: RFC 9293 section 3.8.5 says it points one past the
+// last urgent byte, an older reading says it points at that byte, and
+// real stacks differ.  A program that must interpret it and a receiving
+// host that reads it differently is exactly the disagreement an
+// intrusion detector can be evaded through.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.urgent_pointer(buf, t)
+//                 Ok(u)  => println("${u}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn urgent_pointer(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.urgent_pointer")
+
+// The payload.
+//
+// Empty on a pure acknowledgement.  Whether it is empty is NOT whether
+// the segment advances the sequence space; see `segment_length`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  => println("${pkttcp.payload(t).len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn payload(t: PktTcp) -> PktSpan
+    todo("packet-nv.pkttcp.payload")
+
+// How far this segment advances the sequence number.
+//
+// The payload length, PLUS ONE if the SYN flag is set and PLUS ONE if
+// the FIN flag is set.  RFC 9293 section 3.4 gives both flags a byte of
+// sequence space so that they can be acknowledged and retransmitted
+// like data.
+//
+// This is the number a flow tracker adds to a sequence number to get
+// the next expected one, and using the payload length instead puts
+// every connection one byte out from its handshake onwards — which
+// shows up as the first data segment being reported as a
+// retransmission and every later acknowledgement being reported as
+// covering one byte too few.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.segment_length(buf, t)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn segment_length(buf: Bytes, t: PktTcp) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.segment_length")
+
+// Walk the option area and answer every option in it.
+//
+// End of option list ends the walk, no operation advances one byte, and
+// every other option is a kind byte, a length byte counting both, and
+// the data.  `PktBadOption` when a length byte is 0 or 1, or when an
+// option runs past the header — the shapes that make a naive walk loop
+// forever or read the payload as options.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn options(buf: Bytes, t: PktTcp) -> Result<[PktTcpOption], PktError>
+    todo("packet-nv.pkttcp.options")
+
+// The option's kind byte.
+//
+// 0 end of option list, 1 no operation, 2 maximum segment size, 3
+// window scale, 4 SACK permitted, 5 SACK, 8 timestamps.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn tcp_option_kind(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.tcp_option_kind")
+
+// The option's length in bytes, including the kind and length bytes.
+//
+// 1 for end of option list and no operation, which carry no length
+// byte.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn tcp_option_length(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.tcp_option_length")
+
+// The option's data: everything after the kind and length bytes.
+//
+// THIS IS WHERE AN UNKNOWN OPTION LIVES.  An option this package does
+// not interpret keeps its bytes here rather than being dropped, so a
+// display can show it, a rewriter can copy it forward, and traffic
+// using an option newer than this package can still be read.  The
+// multipath TCP options and the TCP authentication option are the ones
+// most likely to arrive this way.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn tcp_option_data_span(buf: Bytes, o: PktTcpOption) -> Result<PktSpan, PktError>
+    todo("packet-nv.pkttcp.tcp_option_data_span")
+
+// The option's name: `"eol"`, `"nop"`, `"mss"`, `"wscale"`,
+// `"sack-permitted"`, `"sack"`, `"timestamps"`, or the number.
+//
+// A pure function of the kind byte, for a display.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println(pkttcp.tcp_option_name(8))
+// ```
+pub fn tcp_option_name(kind: Int) -> Str
+    todo("packet-nv.pkttcp.tcp_option_name")
+
+// Whether this package interprets an option of that kind.
+//
+// True for 0, 1, 2, 3, 4, 5 and 8.  An option that answers false is
+// still readable through `tcp_option_data_span`; what is false is only
+// that this package knows what the bytes mean.
+//
+// ```novo
+// use pkttcp
+//
+// fn main() [io]
+//     println("${pkttcp.is_known_option(30)}")
+// ```
+pub fn is_known_option(kind: Int) -> Bool
+    todo("packet-nv.pkttcp.is_known_option")
+
+// The maximum segment size an option announces (RFC 9293 section
+// 3.2.1).
+//
+// The largest PAYLOAD the sender is willing to receive in one segment
+// — not the largest datagram and not the largest frame, so the
+// Ethernet maximum transmission unit of 1500 corresponds to 1460 here
+// over IPv4 and 1440 over IPv6.
+//
+// It appears in a SYN and only in a SYN.  `PktNoSuchLayer` when the
+// option is not kind 2, `PktBadLength` when its length is not 4.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn maximum_segment_size(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.maximum_segment_size")
+
+// The window scale shift an option announces (RFC 7323 section 2.2).
+//
+// A left shift from 0 to 14; a sender announcing more than 14 must be
+// treated as announcing 14, and this answers the raw value so the
+// caller can see that it was out of range.  It appears in a SYN and
+// only in a SYN, and it applies to the OTHER direction's windows.
+//
+// `PktNoSuchLayer` when the option is not kind 3, `PktBadLength` when
+// its length is not 3.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn window_scale(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.window_scale")
+
+// Whether the option is SACK-permitted (RFC 2018 section 2).
+//
+// Two bytes with no data, sent in a SYN, announcing that this end will
+// accept selective acknowledgements.  Both ends must send it or neither
+// may use SACK, so a capture where only one SYN carries it explains why
+// a lossy connection recovers slowly.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sack_permitted(buf: Bytes, o: PktTcpOption) -> Result<Bool, PktError>
+    todo("packet-nv.pkttcp.sack_permitted")
+
+// The selective acknowledgement blocks an option carries (RFC 2018
+// section 3).
+//
+// One to four half-open ranges of sequence numbers the receiver already
+// has, above the cumulative acknowledgement.  Four is the most that
+// fits in the forty bytes of option space, and three is the most that
+// fits beside the timestamps option, which is why a connection using
+// timestamps reports one fewer hole than it has.
+//
+// `PktNoSuchLayer` when the option is not kind 5, `PktBadLength` when
+// its length is not eight times the block count plus two.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sack_blocks(buf: Bytes, o: PktTcpOption) -> Result<[PktTcpSack], PktError>
+    todo("packet-nv.pkttcp.sack_blocks")
+
+// The timestamp value an option carries (RFC 7323 section 3.2).
+//
+// The sender's own clock, in whatever units it chose: the
+// specification fixes no unit, so a difference between two timestamps
+// from the SAME sender is meaningful and a difference between two
+// senders' is not.
+//
+// `PktNoSuchLayer` when the option is not kind 8, `PktBadLength` when
+// its length is not 10.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn timestamp_value(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.timestamp_value")
+
+// The timestamp echo reply an option carries (RFC 7323 section 3.2).
+//
+// The most recent timestamp the sender received from its peer, echoed
+// back.  Subtracting it from the receiver's own clock is how a round
+// trip is measured without keeping a table of outstanding segments, and
+// it is the reason a capture can show a round-trip time for a
+// connection it did not see the start of.
+//
+// Meaningful only when the ACK flag is set.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.options(buf, t)
+//                 Ok(os) => println("${list.len(os)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn timestamp_echo(buf: Bytes, o: PktTcpOption) -> Result<Int, PktError>
+    todo("packet-nv.pkttcp.timestamp_echo")
+
+// Verify the checksum over the pseudo-header, the header and the
+// payload.
+//
+// The pseudo-header comes from `pktipv4.pseudo` or `pktipv6.pseudo`,
+// which compute the upper-layer length correctly for their version.
+//
+// `PktChecksumUnverifiable` when the payload is not all present, which
+// is the ordinary case in a capture with a snapshot length, and the
+// answer that keeps a truncated capture from looking corrupt.  Never
+// `PktChecksumAbsent`: a zero TCP checksum is a wrong checksum.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkttcp
+// use pktsum
+// use ip
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     let p = pktsum.pseudo_ipv4(ip.ipv4_zero(), ip.ipv4_zero(), PktProtoTcp, 40)
+//     match pkttcp.parse(buf, pktspan.whole(buf))
+//         Ok(t)  =>
+//             match pkttcp.verify_checksum(buf, t, p)
+//                 Ok(c)  => println(pktsum.checksum_reason(c))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_checksum(buf: Bytes, t: PktTcp, p: PktPseudo) -> Result<PktChecksum, PktError>
+    todo("packet-nv.pkttcp.verify_checksum")
+
+// Pad an option area to a multiple of four bytes.
+//
+// The data offset counts thirty-two-bit words, so an option area of six
+// bytes cannot be expressed.  RFC 9293 section 3.1 pads with
+// end-of-option-list bytes, and a sender that wants an option aligned
+// puts no-operation bytes in front of it instead — which is why a
+// timestamps option is almost always preceded by two of them.
+//
+// ```novo
+// use std.bytes
+// use pkttcp
+//
+// fn main() [io]
+//     println("${bytes.len(pkttcp.pad_options(bytes.zeros(6)))}")
+// ```
+pub fn pad_options(options: Bytes) -> Bytes
+    todo("packet-nv.pkttcp.pad_options")
+
+// Build a TCP segment.
+//
+// Computes the data offset from the option area and the checksum from
+// the pseudo-header, the header and the payload.  `PktBadLength` when
+// the option area is not a multiple of four bytes — `pad_options` is
+// the fix — or longer than forty.  `PktFieldOutOfRange` for a port, a
+// window or a sequence number outside its field.
+//
+// The pseudo-header is a REQUIRED argument and not an optional one,
+// because a TCP checksum without it is not a TCP checksum: RFC 9293
+// section 3.1 covers the addresses, and a segment checksummed without
+// them passes every check on the wrong host.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pkttcp
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+//                                PktProtoTcp, 20)
+//     match pkttcp.build(1234, 80, 1000, 0, 0x02, 65535, bytes.zeros(0),
+//                        bytes.zeros(0), p)
+//         Ok(s)  => println("${bytes.len(s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(source_port: Int, destination_port: Int, sequence: Int, acknowledgement: Int,
+             flags: Int, window: Int, options: Bytes, payload: Bytes,
+             p: PktPseudo) -> Result<Bytes, PktError>
+    todo("packet-nv.pkttcp.build")

@@ -1,0 +1,177 @@
+// pktproto.nv — the IP protocol numbers, which IPv4 calls the protocol
+// field and IPv6 calls the next header, and the one distinction the
+// IPv6 walk turns on.
+//
+// ONE NUMBERING, TWO NAMES
+//
+// RFC 791 section 3.1 names an eight-bit Protocol field in the IPv4
+// header; RFC 8200 section 3 names an eight-bit Next Header field in
+// the IPv6 header and says it uses the same values.  So 6 is TCP in
+// both, 17 is UDP in both, and one enum serves both headers.  That is
+// why this module exists rather than the numbers being declared twice.
+//
+// THE DISTINCTION THE WALK NEEDS
+//
+// Six of the values do not name an upper-layer protocol at all: 0, 43,
+// 44, 51, 60 and 135 name IPv6 extension headers, which sit between
+// the IPv6 header and whatever it is carrying.  A walker looking for
+// the TCP header must follow those and stop at the first value that is
+// not one.  `is_extension_header` is that stop condition, and getting
+// it wrong is not a subtle failure: a datagram with a hop-by-hop
+// header has next header 0, and a program that treated 0 as an
+// upper-layer protocol would report every such datagram as carrying
+// protocol zero.
+//
+// 59 IS NOT AN EXTENSION HEADER AND NOT A PROTOCOL
+//
+// `PktProtoIpv6NoNext` is 59, and RFC 8200 section 4.7 says it means
+// there is nothing after this header.  It is not an unknown upper
+// layer: whatever bytes follow are not a header of any kind and must
+// not be parsed as one.  A walker that handed the following bytes to a
+// TCP parser because it did not recognise 59 would produce a header of
+// whatever happened to be in the padding.
+
+// A value of the IPv4 protocol field or the IPv6 next-header field.
+//
+// The arms are the values this package can do something with.  Every
+// other value is `PktProtoOther`, carrying the number, because the
+// IANA registry has over a hundred entries and a packet carrying one
+// of them is well formed.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println(pktproto.protocol_name(PktProtoTcp))
+// ```
+pub enum PktProtocol
+    // 0.  The IPv6 hop-by-hop options header (RFC 8200 section 4.3).
+    // It is the one extension header that must come first and the one
+    // every router on the path is expected to examine.  As an IPv4
+    // protocol number, 0 is reserved and never appears.
+    PktProtoIpv6HopByHop
+    // 1.  ICMP for IPv4 (RFC 792).
+    PktProtoIcmp
+    // 6.  TCP (RFC 9293).
+    PktProtoTcp
+    // 17.  UDP (RFC 768).
+    PktProtoUdp
+    // 41.  An IPv6 datagram carried inside another IP datagram, which
+    // is what a 6in4 tunnel looks like from outside.
+    PktProtoIpv6
+    // 43.  The IPv6 routing header (RFC 8200 section 4.4).
+    PktProtoIpv6Route
+    // 44.  The IPv6 fragment header (RFC 8200 section 4.5).  Fixed at
+    // eight bytes, unlike every other extension header.
+    PktProtoIpv6Frag
+    // 50.  The Encapsulating Security Payload (RFC 4303).  Everything
+    // after it is encrypted, so the chain ends here for a reader
+    // without the key.
+    PktProtoEsp
+    // 51.  The Authentication Header (RFC 4302).  An extension header
+    // whose length is counted in four-octet units minus two, not in
+    // eight-octet units, which is why the generic walk cannot measure
+    // it.
+    PktProtoAh
+    // 58.  ICMPv6 (RFC 4443).
+    PktProtoIcmpv6
+    // 59.  No next header (RFC 8200 section 4.7).  The chain ends and
+    // what follows is not a header.
+    PktProtoIpv6NoNext
+    // 60.  The IPv6 destination options header (RFC 8200 section 4.6).
+    // It may appear twice in one chain, which is why a walk answers a
+    // list rather than a set of optional fields.
+    PktProtoIpv6Dest
+    // Any other value, carrying the number so a display tool can show
+    // it and a filter can match it.
+    PktProtoOther(number: Int)
+
+// The protocol an eight-bit field value names.
+//
+// Total: every value from 0 to 255 answers something, and the ones
+// this package has no arm for answer `PktProtoOther`.  A value outside
+// that range is `PktProtoOther` carrying what it was given, because a
+// field read cannot produce one and a caller that constructed one has
+// its own mistake to find.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println(pktproto.protocol_name(pktproto.protocol_of(17)))
+//     println(pktproto.protocol_name(pktproto.protocol_of(132)))
+// ```
+pub fn protocol_of(n: Int) -> PktProtocol
+    todo("packet-nv.pktproto.protocol_of")
+
+// The eight-bit field value a protocol is written as.
+//
+// The inverse of `protocol_of` on every arm.  What a builder puts in
+// the IPv4 protocol field or the IPv6 next-header field.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println("${pktproto.protocol_number(PktProtoUdp)}")
+// ```
+pub fn protocol_number(p: PktProtocol) -> Int
+    todo("packet-nv.pktproto.protocol_number")
+
+// The IANA name, lowercase: `"tcp"`, `"udp"`, `"icmp"`, `"icmpv6"`,
+// `"hopopt"`, `"ipv6-route"`, `"ipv6-frag"`, `"esp"`, `"ah"`,
+// `"ipv6-nonxt"`, `"ipv6-opts"`, `"ipv6"`.
+//
+// A `PktProtoOther` answers its number as decimal text, so a display
+// never has a blank where a protocol should be.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println(pktproto.protocol_name(PktProtoIpv6Frag))
+//     println(pktproto.protocol_name(PktProtoOther(89)))
+// ```
+pub fn protocol_name(p: PktProtocol) -> Str
+    todo("packet-nv.pktproto.protocol_name")
+
+// Whether this value names an IPv6 extension header rather than an
+// upper-layer protocol.
+//
+// True for hop-by-hop, routing, fragment, authentication,
+// encapsulating security payload and destination options.  FALSE for
+// `PktProtoIpv6NoNext`, which ends the chain without being a header,
+// and false for everything else.
+//
+// This is the IPv6 walk's stop condition, and `pktipv6.extensions`
+// follows exactly these six.  A walker with a shorter list stops early
+// and reports the extension header's first byte as a source port.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println("${pktproto.is_extension_header(PktProtoIpv6Dest)}")
+//     println("${pktproto.is_extension_header(PktProtoIpv6NoNext)}")
+// ```
+pub fn is_extension_header(p: PktProtocol) -> Bool
+    todo("packet-nv.pktproto.is_extension_header")
+
+// Whether an ICMPv6 checksum is required over this protocol's
+// pseudo-header, which is to say whether the protocol is ICMPv6.
+//
+// It is here rather than in `pkticmp` because the caller asking is the
+// IPv6 walk, which has a `PktProtocol` and not yet a header.  RFC 4443
+// section 2.3 makes the ICMPv6 checksum mandatory and
+// pseudo-header-covered, which is the one way ICMPv6 differs from
+// ICMP for IPv4 at the checksum.
+//
+// ```novo
+// use pktproto
+//
+// fn main() [io]
+//     println("${pktproto.needs_pseudo_header(PktProtoIcmpv6)}")
+//     println("${pktproto.needs_pseudo_header(PktProtoIcmp)}")
+// ```
+pub fn needs_pseudo_header(p: PktProtocol) -> Bool
+    todo("packet-nv.pktproto.needs_pseudo_header")

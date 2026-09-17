@@ -1,0 +1,616 @@
+// pkticmp.nv — ICMP for IPv4 (RFC 792) and ICMPv6 (RFC 4443), which
+// share a four-byte header and differ in every rule about it.
+//
+// THE SAME FOUR BYTES, TWO REGISTRIES
+//
+// Both protocols start with a type byte, a code byte and a two-byte
+// checksum, and the numbers mean different things in each: type 3 is
+// destination unreachable in ICMP for IPv4 and destination unreachable
+// in ICMPv6, but type 1 is destination unreachable in ICMPv6 and echo
+// reply in ICMP for IPv4.  So there are two types here, `PktIcmp` and
+// `PktIcmpv6`, and no function takes both.  A single type with a
+// version flag would put the version in a field that a caller could
+// forget to set, and the failure would be a message decoded against the
+// wrong registry — which produces a name rather than an error.
+//
+// IN ICMPv6 ONE BIT SAYS WHETHER IT IS AN ERROR
+//
+// RFC 4443 section 2.1 splits the type space in half: 0 to 127 are
+// error messages and 128 to 255 are informational.  The TOP BIT of the
+// type byte is the answer, and that is deliberate — a receiver that
+// meets a type it does not know still knows whether it is an error, and
+// an error must not be answered with another error.
+//
+// ICMP for IPv4 has no such rule.  Its error types are a list — 3, 4,
+// 5, 11, 12 — and a reader must check membership.  `icmp_is_error` and
+// `icmpv6_is_error` are therefore two different functions with two
+// different implementations, and treating either as the other gets
+// roughly half the type space wrong.
+//
+// THE CHECKSUM RULE DIFFERS TOO
+//
+// ICMP for IPv4 checksums its own bytes and nothing else.  ICMPv6's
+// checksum is MANDATORY and covers the IPv6 pseudo-header (RFC 4443
+// section 2.3), which is why `verify_checksum_v6` takes a pseudo-header
+// and `verify_checksum` does not, and why `build_v6` needs the source
+// and destination addresses while `build` does not.
+//
+// THE MOST USEFUL FIELD IS THE PACKET INSIDE
+//
+// An ICMP error carries the header of the datagram that caused it —
+// the IP header and at least the first eight bytes after it, which is
+// enough for the ports of a TCP or UDP datagram.  That is what makes an
+// error attributable to a flow: a destination unreachable is useless on
+// its own and tells a program exactly which connection is broken when
+// the embedded header is read.
+//
+// The embedded header is the ORIGINAL SENDER'S, so its source address
+// is the host that received the error and its destination is the host
+// that could not be reached.  Both are reversed with respect to the
+// ICMP message's own addresses, and a tool that did not reverse them
+// attributes every error to the wrong direction of the wrong flow.
+
+// An ICMP message for IPv4, as a span into the caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  => println("${m.span.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIcmp
+    // The whole message: the four-byte header, the four-byte rest
+    // field and the body.
+    span: PktSpan
+
+// An ICMPv6 message, as a span into the caller's buffer.
+//
+// A separate type from `PktIcmp` because the type numbers mean
+// different things and mixing them decodes a message against the wrong
+// registry.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  => println("${m.span.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIcmpv6
+    // The whole message: the four-byte header, the four-byte rest
+    // field and the body.
+    span: PktSpan
+
+// Read an ICMP message for IPv4 out of a span.
+//
+// Requires eight bytes: the type, the code, the checksum and the
+// four-byte rest field, which every message has even when it is unused.
+// `PktTruncated` otherwise.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  => println("${m.span.off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktIcmp, PktError>
+    todo("packet-nv.pkticmp.parse")
+
+// Read an ICMPv6 message out of a span.
+//
+// Requires eight bytes, as `parse` does.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  => println("${m.span.off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_v6(buf: Bytes, at: PktSpan) -> Result<PktIcmpv6, PktError>
+    todo("packet-nv.pkticmp.parse_v6")
+
+// The message type: 0 echo reply, 3 destination unreachable, 8 echo
+// request, 11 time exceeded.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_type(buf, m)
+//                 Ok(t)  => println(pkticmp.icmp_type_name(t))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_type(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_type")
+
+// The code: what the type means more precisely.
+//
+// Code 4 under type 3 is "fragmentation needed and don't fragment set",
+// which is the message path maximum transmission unit discovery
+// depends on.  A network that filters it is a network where large
+// transfers hang after a working handshake, and this is the field that
+// identifies it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_code(buf, m)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_code(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_code")
+
+// The checksum as the message carries it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_checksum(buf, m)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_checksum(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_checksum")
+
+// The four bytes after the checksum, whatever this type uses them for.
+//
+// AN OVERLOADED FIELD, and answering it raw is the honest shape.  On an
+// echo it is an identifier and a sequence number; on a destination
+// unreachable with code 4 the low sixteen bits are the next hop's
+// maximum transmission unit; on a redirect it is a gateway address; on
+// most other types it is unused and must be zero.  A struct with one
+// name for it would name it wrongly for every type but one.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_rest(buf, m)
+//                 Ok(r)  => println("${r}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_rest(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_rest")
+
+// An echo message's identifier: the top half of the rest field.
+//
+// What a host uses to match a reply to the process that sent the
+// request.  `PktNoSuchLayer` when the type is neither 8 nor 0.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_identifier(buf, m)
+//                 Ok(i)  => println("${i}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_identifier(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_identifier")
+
+// An echo message's sequence number: the bottom half of the rest field.
+//
+// `PktNoSuchLayer` when the type is neither 8 nor 0.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_sequence(buf, m)
+//                 Ok(s)  => println("${s}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_sequence(buf: Bytes, m: PktIcmp) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmp_sequence")
+
+// Everything after the eight-byte header.
+//
+// An echo's data on an echo, and the embedded datagram on an error —
+// `icmp_embedded_span` is the one that names it as that.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_payload_span(buf, m)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_payload_span(buf: Bytes, m: PktIcmp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pkticmp.icmp_payload_span")
+
+// Whether this type is an error message.
+//
+// True for 3, 4, 5, 11 and 12 — a LIST, because ICMP for IPv4 has no
+// structural rule the way ICMPv6 does.  A reader that used ICMPv6's
+// top-bit rule here would call an echo reply an error and a timestamp
+// request an informational message, and be right about neither.
+//
+// ```novo
+// use pkticmp
+//
+// fn main() [io]
+//     println("${pkticmp.icmp_is_error(3)}")
+//     println("${pkticmp.icmp_is_error(8)}")
+// ```
+pub fn icmp_is_error(type_number: Int) -> Bool
+    todo("packet-nv.pkticmp.icmp_is_error")
+
+// The type's name: `"echo-reply"`, `"destination-unreachable"`,
+// `"redirect"`, `"echo-request"`, `"time-exceeded"`, or the number.
+//
+// ```novo
+// use pkticmp
+//
+// fn main() [io]
+//     println(pkticmp.icmp_type_name(11))
+// ```
+pub fn icmp_type_name(type_number: Int) -> Str
+    todo("packet-nv.pkticmp.icmp_type_name")
+
+// The datagram that caused an error, as a span.
+//
+// RFC 792 requires an error to carry the offending datagram's IP header
+// and the first eight bytes after it — which is the ports of a TCP or
+// UDP datagram, and therefore enough to name the flow.  RFC 1812
+// section 4.3.2.3 raised the recommendation to as much of the datagram
+// as fits in 576 bytes, so there is usually more.
+//
+// THE ADDRESSES INSIDE ARE REVERSED with respect to the ICMP message's
+// own: the embedded source is the host that received the error.
+//
+// `PktNoSuchLayer` when the type is not an error type.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(40)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmp_embedded_span(buf, m)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmp_embedded_span(buf: Bytes, m: PktIcmp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pkticmp.icmp_embedded_span")
+
+// Verify an ICMP for IPv4 checksum.
+//
+// Over the message's own bytes and NO pseudo-header (RFC 792).  That is
+// the difference from ICMPv6, and it means an ICMP message with a valid
+// checksum says nothing about which addresses it was sent between.
+//
+// Never `PktChecksumAbsent`: a zero here is a wrong checksum.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+// use pktsum
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.verify_checksum(buf, m)
+//                 Ok(c)  => println(pktsum.checksum_reason(c))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_checksum(buf: Bytes, m: PktIcmp) -> Result<PktChecksum, PktError>
+    todo("packet-nv.pkticmp.verify_checksum")
+
+// Build an ICMP message for IPv4.
+//
+// Writes the type, the code and the four-byte rest field, appends the
+// body, and computes the checksum over all of it.  No pseudo-header,
+// because RFC 792's checksum covers nothing outside the message.
+//
+// `PktFieldOutOfRange` for a type or code above 255 or a rest field
+// that does not fit thirty-two bits.
+//
+// ```novo
+// use std.bytes
+// use pkticmp
+//
+// fn main() [io]
+//     match pkticmp.build(8, 0, 0x00010001, bytes.zeros(56))
+//         Ok(m)  => println("${bytes.len(m)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(type_number: Int, code: Int, rest: Int, body: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pkticmp.build")
+
+// An ICMPv6 message's type: 1 destination unreachable, 3 time
+// exceeded, 128 echo request, 129 echo reply, 135 neighbour
+// solicitation, 136 neighbour advertisement.
+//
+// The last two are how IPv6 resolves link addresses, which is what ARP
+// does for IPv4 — so a tool looking for address resolution on an IPv6
+// network looks here and not in `pktarp`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_type(buf, m)
+//                 Ok(t)  => println(pkticmp.icmpv6_type_name(t))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_type(buf: Bytes, m: PktIcmpv6) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmpv6_type")
+
+// An ICMPv6 message's code.
+//
+// Code 0 under type 2, packet too big, is the message IPv6 path
+// maximum transmission unit discovery depends on, and IPv6 routers do
+// not fragment — so a path that filters it does not merely slow a
+// transfer, it stops it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_code(buf, m)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_code(buf: Bytes, m: PktIcmpv6) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmpv6_code")
+
+// An ICMPv6 message's checksum as it carries it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_checksum(buf, m)
+//                 Ok(c)  => println("${c}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_checksum(buf: Bytes, m: PktIcmpv6) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmpv6_checksum")
+
+// The four bytes after an ICMPv6 checksum, whatever this type uses them
+// for.
+//
+// The maximum transmission unit on a packet-too-big, the identifier and
+// sequence on an echo, flags on a neighbour advertisement, and zero on
+// several others.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_rest(buf, m)
+//                 Ok(r)  => println("${r}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_rest(buf: Bytes, m: PktIcmpv6) -> Result<Int, PktError>
+    todo("packet-nv.pkticmp.icmpv6_rest")
+
+// Everything after an ICMPv6 message's eight-byte header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_payload_span(buf, m)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_payload_span(buf: Bytes, m: PktIcmpv6) -> Result<PktSpan, PktError>
+    todo("packet-nv.pkticmp.icmpv6_payload_span")
+
+// Whether an ICMPv6 type is an error message.
+//
+// THE TOP BIT OF THE TYPE BYTE: 0 to 127 are errors and 128 to 255 are
+// informational (RFC 4443 section 2.1).  It is one comparison and no
+// list, which is the point of the split — a receiver meeting a type it
+// has never heard of still knows whether it is an error, and knows not
+// to answer it with another error.
+//
+// ```novo
+// use pkticmp
+//
+// fn main() [io]
+//     println("${pkticmp.icmpv6_is_error(1)}")
+//     println("${pkticmp.icmpv6_is_error(128)}")
+// ```
+pub fn icmpv6_is_error(type_number: Int) -> Bool
+    todo("packet-nv.pkticmp.icmpv6_is_error")
+
+// An ICMPv6 type's name: `"destination-unreachable"`,
+// `"packet-too-big"`, `"time-exceeded"`, `"echo-request"`,
+// `"echo-reply"`, `"neighbour-solicitation"`,
+// `"neighbour-advertisement"`, `"router-advertisement"`, or the number.
+//
+// ```novo
+// use pkticmp
+//
+// fn main() [io]
+//     println(pkticmp.icmpv6_type_name(135))
+// ```
+pub fn icmpv6_type_name(type_number: Int) -> Str
+    todo("packet-nv.pkticmp.icmpv6_type_name")
+
+// The datagram that caused an ICMPv6 error, as a span.
+//
+// RFC 4443 section 2.4 says an error carries as much of the offending
+// datagram as fits without making the message exceed the minimum IPv6
+// maximum transmission unit of 1280 bytes — more than IPv4's eight
+// bytes, and enough to include an extension chain.
+//
+// The addresses inside are reversed with respect to the message's own,
+// as they are in IPv4.  `PktNoSuchLayer` when the type is not an error
+// type.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pkticmp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.icmpv6_embedded_span(buf, m)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn icmpv6_embedded_span(buf: Bytes, m: PktIcmpv6) -> Result<PktSpan, PktError>
+    todo("packet-nv.pkticmp.icmpv6_embedded_span")
+
+// Verify an ICMPv6 checksum.
+//
+// MANDATORY AND PSEUDO-HEADER-COVERED (RFC 4443 section 2.3), which is
+// the one way ICMPv6 differs from ICMP for IPv4 at the checksum and the
+// reason this function takes a pseudo-header while `verify_checksum`
+// does not.  The pseudo-header's next-header value is 58.
+//
+// Never `PktChecksumAbsent`: there is no optional form.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktspan
+// use pkticmp
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(16)
+//     let p = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 16)
+//     match pkticmp.parse_v6(buf, pktspan.whole(buf))
+//         Ok(m)  =>
+//             match pkticmp.verify_checksum_v6(buf, m, p)
+//                 Ok(c)  => println(pktsum.checksum_reason(c))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn verify_checksum_v6(buf: Bytes, m: PktIcmpv6, p: PktPseudo) -> Result<PktChecksum, PktError>
+    todo("packet-nv.pkticmp.verify_checksum_v6")
+
+// Build an ICMPv6 message.
+//
+// Takes a pseudo-header, because the ICMPv6 checksum covers one and a
+// message built without it fails at every receiver.  That is the whole
+// signature difference from `build`, and it is here rather than in a
+// flag so that a caller cannot build an ICMPv6 message without having
+// the addresses to hand.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pkticmp
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 16)
+//     match pkticmp.build_v6(128, 0, 0x00010001, bytes.zeros(8), p)
+//         Ok(m)  => println("${bytes.len(m)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build_v6(type_number: Int, code: Int, rest: Int, body: Bytes,
+                p: PktPseudo) -> Result<Bytes, PktError>
+    todo("packet-nv.pkticmp.build_v6")

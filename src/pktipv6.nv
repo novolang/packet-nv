@@ -1,0 +1,960 @@
+// pktipv6.nv — the IPv6 header of RFC 8200 and the extension-header
+// chain that has to be walked to find out what the datagram carries.
+//
+// THE FIXED HEADER IS EASY AND IT IS NOT THE PROBLEM
+//
+// Forty bytes, no options, no header length, no checksum.  Everything
+// hard about IPv6 parsing is in the chain that may follow it.
+//
+// THE CHAIN
+//
+// The next-header byte of the fixed header does not name the transport
+// protocol.  It names whatever comes next, which may be a hop-by-hop
+// options header, which names whatever comes after that, and so on
+// until a byte names something that is not an extension header.  A
+// datagram with no extensions has one step in that walk and a datagram
+// with four has five.
+//
+// A parser that read the fixed header's next-header byte as the
+// transport protocol reports a datagram with a hop-by-hop header as
+// carrying protocol 0 and one with a fragment header as carrying
+// protocol 44 — and then, if it went on to parse a TCP header at offset
+// forty, read the extension header's own bytes as ports.  Both failures
+// produce numbers rather than errors.
+//
+// `extensions` walks the chain, `upper_layer` answers what it ends at,
+// and `upper_layer_span` answers where that starts.
+//
+// THREE LENGTH RULES, NOT ONE
+//
+// Most extension headers measure themselves in eight-octet units, not
+// counting the first eight: a header of hdr-ext-len 0 is eight bytes
+// long and one of 1 is sixteen.  Two do not follow that rule:
+//
+//   * the FRAGMENT header is fixed at eight bytes and its second byte
+//     is RESERVED (RFC 8200 section 4.5).  A walker that applied the
+//     general formula gets eight whenever that byte happens to be
+//     zero, and something else when a sender leaves it dirty.
+//   * the AUTHENTICATION header measures in FOUR-octet units minus two
+//     (RFC 4302 section 2.2).  The general formula gives a length
+//     roughly twice the truth, which lands the walk in the middle of
+//     the next header.
+//
+// The encapsulating security payload ends the walk: everything after it
+// is encrypted and a reader without the key has nothing to parse.
+//
+// THE CHAIN IS BOUNDED HERE
+//
+// A destination-options header can be eight bytes of padding, and
+// nothing in RFC 8200 limits how many may be chained. A datagram built
+// out of hundreds of them is a denial of service against any walker
+// with no bound, and several stacks have been patched for exactly that.
+// `extension_limit` is the bound and `PktExtChainTooLong` is what a
+// longer chain gets.
+//
+// PAYLOAD LENGTH ZERO MEANS ONE OF TWO THINGS
+//
+// A payload length of zero is either a jumbogram — a datagram longer
+// than 65535 bytes, whose real length is in a hop-by-hop jumbo payload
+// option (RFC 2675) — or a capture of an offloaded send taken on the
+// sending host before the network card filled the field in.  It is not
+// an empty datagram.  `parse` refuses it and `parse_offloaded` accepts
+// it, the same split `pktipv4` makes for the same reason.
+
+// An IPv6 header, as spans into the caller's buffer.
+//
+// The chain that may follow is not parsed by `parse`; `extensions` is
+// what walks it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.header.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIpv6
+    // The forty-byte fixed header.  Always forty bytes: IPv6 has no
+    // header length field because it has no options in the header.
+    header: PktSpan
+    // Everything after the fixed header, narrowed to the payload
+    // length.  The extension chain, if there is one, starts here.
+    payload: PktSpan
+
+// One extension header, as a span, with the value that named it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIpv6Ext
+    // The whole extension header: its next-header byte, its length
+    // byte, and its data.
+    span: PktSpan
+    // WHAT THIS HEADER IS, as the PREVIOUS header's next-header byte
+    // named it.  It is here because an extension header does not say
+    // what it is — its own first byte says what comes AFTER it.  A
+    // header read out of the middle of a datagram therefore cannot be
+    // identified at all, which is why the chain is walked from the
+    // fixed header and never entered part-way.
+    kind: Int
+
+// One TLV option inside a hop-by-hop or destination-options header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub struct PktIpv6Option
+    // The whole option: one byte for Pad1, and a type byte, a length
+    // byte and the data for every other.
+    span: PktSpan
+
+// Read an IPv6 fixed header out of a span.
+//
+// Checks the version is 6 and that the payload length fits inside the
+// span.  `PktBadVersion` and `PktTruncated` are the two refusals.  A
+// payload length of zero is `PktBadLength`; `parse_offloaded` accepts
+// it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktIpv6, PktError>
+    todo("packet-nv.pktipv6.parse")
+
+// Read an IPv6 fixed header, accepting a payload length of zero.
+//
+// For a jumbogram (RFC 2675), whose real length is in a hop-by-hop
+// option, and for a capture of an offloaded send taken before the
+// network card wrote the field.  The payload runs to the end of the
+// span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse_offloaded(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${h.payload.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_offloaded(buf: Bytes, at: PktSpan) -> Result<PktIpv6, PktError>
+    todo("packet-nv.pktipv6.parse_offloaded")
+
+// The version nibble, which `parse` has already checked is 6.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.version(buf, h)
+//                 Ok(v)  => println("${v}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn version(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.version")
+
+// The traffic class byte: the differentiated services code point and
+// the congestion notification bits together.
+//
+// It spans a nibble boundary — the top four bits are in the first byte
+// of the header and the bottom four in the second — which is why
+// reading it by hand is a common place to lose the low half.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.traffic_class(buf, h)
+//                 Ok(t)  => println("${t}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn traffic_class(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.traffic_class")
+
+// The differentiated services code point: the top six bits of the
+// traffic class (RFC 2474 section 3).
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.dscp(buf, h)
+//                 Ok(d)  => println("${d}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn dscp(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.dscp")
+
+// The explicit congestion notification bits: the low two bits of the
+// traffic class (RFC 3168 section 5).
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.ecn(buf, h)
+//                 Ok(v)  => println("${v}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ecn(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.ecn")
+
+// The flow label: twenty bits identifying a stream of packets the
+// sender wants treated alike (RFC 6437).
+//
+// Zero means the sender is not using it, and it is not a hash of
+// anything a reader can recompute — it is chosen by the source, so two
+// flows with the same label are not necessarily related and one flow
+// may change labels.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.flow_label(buf, h)
+//                 Ok(f)  => println("${f}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn flow_label(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.flow_label")
+
+// The payload length: everything after the forty-byte fixed header,
+// extension headers INCLUDED.
+//
+// Not the transport payload, and not the total datagram length — the
+// two things it is most often mistaken for.  A datagram with a
+// forty-byte extension chain and eight bytes of UDP has a payload
+// length of forty-eight.
+//
+// Zero means a jumbogram or an offloaded send; see `parse_offloaded`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.payload_length(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn payload_length(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.payload_length")
+
+// The fixed header's next-header byte: what comes IMMEDIATELY after
+// the forty bytes.
+//
+// It is the first extension header when there is one, and the
+// transport protocol only when there is not.  `upper_layer` is the
+// function that answers what the datagram actually carries; using this
+// one for that is the mistake this module exists to prevent.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.next_header(buf, h)
+//                 Ok(p)  => println(pktproto.protocol_name(p))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn next_header(buf: Bytes, h: PktIpv6) -> Result<PktProtocol, PktError>
+    todo("packet-nv.pktipv6.next_header")
+
+// The hop limit: IPv6's name for the time to live.
+//
+// A hop count.  Every router decrements it and discards the datagram at
+// zero, sending back an ICMPv6 time exceeded.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.hop_limit(buf, h)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn hop_limit(buf: Bytes, h: PktIpv6) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.hop_limit")
+
+// The source address.
+//
+// TOTAL, AND NOT BY CHOICE.  `Ipv6` is a `@value` struct, which may be
+// neither a `Result` payload nor an option (SPEC section 14.5), so no
+// reason can come back from here.  `parse` has already proved the
+// forty-byte header fits the buffer it was given; called with a
+// DIFFERENT buffer this answers the unspecified address.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println(show.addr6(pktipv6.source(buf, h)))
+//         Err(e) => println(e.message())
+// ```
+pub fn source(buf: Bytes, h: PktIpv6) -> Ipv6
+    todo("packet-nv.pktipv6.source")
+
+// The destination address.
+//
+// Total, on the same terms as `source`.  On a datagram carrying a
+// routing header this is the NEXT hop in the source route and not the
+// final destination, which is in the routing header's address list —
+// RFC 8200 section 4.4.  A tool attributing traffic by destination
+// address must read the routing header or it attributes it to the
+// wrong host.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println(show.addr6(pktipv6.destination(buf, h)))
+//         Err(e) => println(e.message())
+// ```
+pub fn destination(buf: Bytes, h: PktIpv6) -> Ipv6
+    todo("packet-nv.pktipv6.destination")
+
+// The sixteen bytes of the source address, as a span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv6.source_span(h).off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn source_span(h: PktIpv6) -> PktSpan
+    todo("packet-nv.pktipv6.source_span")
+
+// The sixteen bytes of the destination address, as a span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv6.destination_span(h).off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn destination_span(h: PktIpv6) -> PktSpan
+    todo("packet-nv.pktipv6.destination_span")
+
+// Everything after the fixed header, narrowed to the payload length.
+//
+// The extension chain and the upper-layer packet together.
+// `upper_layer_span` is the one that skips the chain.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  => println("${pktipv6.payload(h).len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn payload(h: PktIpv6) -> PktSpan
+    todo("packet-nv.pktipv6.payload")
+
+// The largest number of extension headers a chain may have here.
+//
+// A bound, because RFC 8200 gives none and a chain of empty
+// destination-options headers can be made as long as a datagram
+// allows.  A walker with no bound spends time proportional to the
+// datagram size on a packet anybody can send.
+//
+// ```novo
+// use pktipv6
+//
+// fn main() [io]
+//     println("${pktipv6.extension_limit()}")
+// ```
+pub fn extension_limit() -> Int
+    todo("packet-nv.pktipv6.extension_limit")
+
+// Walk the extension-header chain.
+//
+// Starts at the fixed header's next-header byte and follows each
+// header's own next-header byte until one names something that is not
+// an extension header.  Answers them in the order they appear, which is
+// the order RFC 8200 section 4.1 recommends senders use and does not
+// require.
+//
+// The three length rules are applied: eight times the length byte plus
+// eight for most headers, a fixed eight for the fragment header whose
+// length byte is reserved, and four times the length byte plus eight
+// for the authentication header.  The walk stops at an encapsulating
+// security payload, because what follows it is encrypted.
+//
+// `PktExtChainTooLong` past `extension_limit`, `PktTruncated` when a
+// header runs past the payload, `PktBadLength` when a header's length
+// would not advance the walk.
+//
+// An empty list is the ordinary answer: most IPv6 datagrams have no
+// extension headers at all.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn extensions(buf: Bytes, h: PktIpv6) -> Result<[PktIpv6Ext], PktError>
+    todo("packet-nv.pktipv6.extensions")
+
+// What the datagram actually carries, after the whole chain.
+//
+// THE FUNCTION TO ASK, rather than `next_header`.  For a datagram with
+// no extension headers the two agree; for one with a hop-by-hop header
+// `next_header` answers hop-by-hop and this answers TCP.
+//
+// `PktProtoIpv6NoNext` when the chain ends with 59, which means there
+// is no upper-layer packet at all and the bytes after the chain are not
+// a header of any kind.  `PktProtoEsp` when the chain reaches an
+// encapsulating security payload, because what is inside it cannot be
+// read without the key.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.upper_layer(buf, h)
+//                 Ok(p)  => println(pktproto.protocol_name(p))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn upper_layer(buf: Bytes, h: PktIpv6) -> Result<PktProtocol, PktError>
+    todo("packet-nv.pktipv6.upper_layer")
+
+// Where the upper-layer packet starts, and how long it is.
+//
+// The payload span with every extension header removed from the front.
+// What `pkttcp.parse` and `pktudp.parse` are given.
+//
+// `PktNoSuchLayer` when the chain ends in no-next-header or in an
+// encapsulating security payload, because there is no upper-layer
+// packet to point at.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.upper_layer_span(buf, h)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn upper_layer_span(buf: Bytes, h: PktIpv6) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktipv6.upper_layer_span")
+
+// What kind of extension header this is.
+//
+// From the `kind` the walk recorded, which came from the PREVIOUS
+// header's next-header byte.  An extension header's own first byte
+// says what follows it, never what it is.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use pktproto
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ext_kind(e: PktIpv6Ext) -> PktProtocol
+    todo("packet-nv.pktipv6.ext_kind")
+
+// This extension header's own next-header byte: what follows it.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ext_next_header(buf: Bytes, e: PktIpv6Ext) -> Result<PktProtocol, PktError>
+    todo("packet-nv.pktipv6.ext_next_header")
+
+// The extension header's length in BYTES.
+//
+// Already computed by the walk under whichever of the three rules
+// applies, so a caller never applies the eight-octet formula to a
+// fragment header or an authentication header by mistake.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ext_length(e: PktIpv6Ext) -> Int
+    todo("packet-nv.pktipv6.ext_length")
+
+// The extension header's data: everything after its next-header and
+// length bytes.
+//
+// For the fragment header this is the offset, the flag and the
+// identification; for a hop-by-hop or destination-options header it is
+// the TLV option area that `ext_options` walks.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ext_data_span(e: PktIpv6Ext) -> PktSpan
+    todo("packet-nv.pktipv6.ext_data_span")
+
+// Walk the TLV options of a hop-by-hop or destination-options header.
+//
+// Pad1 is option type 0 and is ONE byte with no length; PadN and every
+// other option are a type byte, a length byte counting neither of them,
+// and the data (RFC 8200 section 4.2).  `PktBadOption` when an option
+// runs past the header.
+//
+// `PktNoSuchLayer` for an extension header that carries no options —
+// fragment, routing and authentication headers have their own layouts.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ext_options(buf: Bytes, e: PktIpv6Ext) -> Result<[PktIpv6Option], PktError>
+    todo("packet-nv.pktipv6.ext_options")
+
+// The option's whole type byte, action bits and change bit and number
+// together.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ipv6_option_type(buf: Bytes, o: PktIpv6Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.ipv6_option_type")
+
+// What a receiver must do with an option it does not recognise: the
+// top two bits of the type byte (RFC 8200 section 4.2).
+//
+// 0 means skip the option and carry on, 1 means discard the datagram
+// silently, 2 means discard it and always send an ICMPv6 parameter
+// problem, 3 means discard it and send one unless the destination was
+// a multicast address.
+//
+// The rule is IN THE OPTION, which is what lets a new option be
+// deployed without every existing router being updated — and it is why
+// an unrecognised option is not simply ignored.  A firewall that
+// skipped every option it did not know would forward datagrams its
+// operator had told it to drop.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ipv6_option_action(buf: Bytes, o: PktIpv6Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.ipv6_option_action")
+
+// The option's length in bytes, including its type and length bytes.
+//
+// One for Pad1, which has neither a length byte nor data.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ipv6_option_length(buf: Bytes, o: PktIpv6Option) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.ipv6_option_length")
+
+// The option's data: everything after its type and length bytes.
+//
+// Empty for Pad1.  An option this package does not interpret keeps its
+// bytes here — the jumbo payload length of RFC 2675, a router alert
+// value, anything newer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn ipv6_option_data_span(buf: Bytes, o: PktIpv6Option) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktipv6.ipv6_option_data_span")
+
+// A fragment header's fragment offset, in BYTES.
+//
+// The field counts eight-byte units, as IPv4's does, and is multiplied
+// by eight here.  `PktNoSuchLayer` when the header is not a fragment
+// header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn fragment_offset(buf: Bytes, e: PktIpv6Ext) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.fragment_offset")
+
+// A fragment header's more-fragments flag.
+//
+// `PktNoSuchLayer` when the header is not a fragment header.
+//
+// A fragment header with this clear and an offset of zero is an ATOMIC
+// fragment: a datagram that was never fragmented but carries the header
+// anyway, which RFC 8200 section 4.5 requires be processed as a whole
+// datagram rather than queued for reassembly.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn fragment_more(buf: Bytes, e: PktIpv6Ext) -> Result<Bool, PktError>
+    todo("packet-nv.pktipv6.fragment_more")
+
+// A fragment header's identification: the thirty-two-bit number that
+// groups one datagram's fragments.
+//
+// Thirty-two bits where IPv4 has sixteen, which is why IPv6
+// reassembly does not collide the way IPv4's does on a fast link.
+// `PktNoSuchLayer` when the header is not a fragment header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn fragment_identification(buf: Bytes, e: PktIpv6Ext) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.fragment_identification")
+
+// A routing header's type (RFC 8200 section 4.4).
+//
+// Type 0 was the source routing that RFC 5095 deprecated, because it
+// let anyone amplify traffic between two routers.  Type 2 is mobile
+// IPv6's, type 3 is the routing protocol for low-power networks, and
+// type 4 is segment routing.  `PktNoSuchLayer` when the header is not a
+// routing header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn routing_type(buf: Bytes, e: PktIpv6Ext) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.routing_type")
+
+// A routing header's segments-left count: how many hops of the route
+// remain.
+//
+// Zero means the datagram has reached the last address in the list, so
+// the destination address in the fixed header is the real one.  A
+// non-zero value means it is not.  `PktNoSuchLayer` when the header is
+// not a routing header.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.extensions(buf, h)
+//                 Ok(xs) => println("${list.len(xs)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn routing_segments_left(buf: Bytes, e: PktIpv6Ext) -> Result<Int, PktError>
+    todo("packet-nv.pktipv6.routing_segments_left")
+
+// The pseudo-header for this datagram's transport checksum.
+//
+// Source, destination, the UPPER-LAYER protocol from the end of the
+// chain, and the upper-layer packet length — which is the payload
+// length less every extension header, not the payload length.  Both
+// subtractions come from the walked chain, which is why this lives here
+// and not in the caller.
+//
+// `PktNoSuchLayer` when the chain has no upper-layer packet.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktipv6
+// use pktsum
+//
+// fn main() [io]
+//     let buf = bytes.zeros(48)
+//     match pktipv6.parse(buf, pktspan.whole(buf))
+//         Ok(h)  =>
+//             match pktipv6.pseudo(buf, h)
+//                 Ok(p)  => println("${pktsum.pseudo_length(p)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn pseudo(buf: Bytes, h: PktIpv6) -> Result<PktPseudo, PktError>
+    todo("packet-nv.pktipv6.pseudo")
+
+// Build an IPv6 datagram with no extension headers.
+//
+// `next_header` goes straight in the fixed header, so the payload is
+// the upper-layer packet.  `PktFieldOutOfRange` for a traffic class
+// above 255, a flow label above 1048575 or a hop limit above 255, and
+// `PktBadLength` for a payload longer than 65535 bytes — a jumbogram
+// needs a hop-by-hop option this function does not write.
+//
+// A datagram with extension headers is built by concatenating them into
+// the payload and naming the first one as `next_header`, because the
+// chain's shape is the caller's decision and there is no correct
+// default order for it.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktipv6
+// use pktproto
+//
+// fn main() [io]
+//     match pktipv6.build(0, 0, PktProtoUdp, 64, ip.ipv6_zero(), ip.ipv6_zero(),
+//                         bytes.zeros(12))
+//         Ok(d)  => println("${bytes.len(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(traffic_class: Int, flow_label: Int, next_header: PktProtocol, hop_limit: Int,
+             source: Ipv6, destination: Ipv6, payload: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pktipv6.build")

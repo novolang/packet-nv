@@ -1,0 +1,184 @@
+// pktarp_tests.nv — a header with no fixed layout.
+//
+// RED ON PURPOSE.  What is asserted is that the address offsets are
+// computed from the two length bytes, that an address accessor refuses
+// a packet that is not Ethernet over IPv4, and that a probe and an
+// announcement are told apart.
+
+use std.test
+use std.bytes
+use ip
+use pktspan
+use pktarp
+
+// An ARP request, Ethernet over IPv4: hardware type 1, protocol type
+// 0x0800, lengths 6 and 4, operation 1, sender 02:00:00:00:00:01 at
+// 10.0.0.1, target zeroes at 10.0.0.2.
+fn request() -> Bytes
+    bytes.from_byte_list(
+        [0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+         0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0A, 0x00, 0x00, 0x01,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x02])
+
+// The same packet with the protocol type changed to IPv6, which RFC
+// 826 permits and which `sender_ipv4_span` must refuse.
+fn not_ipv4() -> Bytes
+    bytes.set_u16_be(request(), 2, 0x86DD)
+
+fn mac() -> Bytes
+    bytes.from_byte_list([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+
+@test
+fn test_the_offsets_are_computed_and_not_baked_in() [io]
+    // A parser with the Ethernet-over-IPv4 offsets in it reads the
+    // wrong bytes the first time it meets anything else.
+    let a = request()
+    match pktarp.parse(a, pktspan.whole(a))
+        Ok(p)  =>
+            test.case("twenty-eight bytes, from eight plus twice six plus twice four")
+            test.assert(p.span.len == 28)
+
+            test.case("the two length bytes are what every later offset depends on")
+            match pktarp.hardware_length(a, p)
+                Ok(n)  => test.assert(n == 6)
+                Err(_) => test.fail("an Ethernet address is six bytes")
+            match pktarp.protocol_length(a, p)
+                Ok(n)  => test.assert(n == 4)
+                Err(_) => test.fail("an IPv4 address is four bytes")
+
+            test.case("and the four address spans fall where those lengths put them")
+            match pktarp.sender_hardware_span(a, p)
+                Ok(s)  =>
+                    test.assert(s.off == 8)
+                    test.assert(s.len == 6)
+                Err(_) => test.fail("the sender hardware address is at offset eight")
+            match pktarp.sender_protocol_span(a, p)
+                Ok(s)  => test.assert(s.off == 14)
+                Err(_) => test.fail("it follows the sender hardware address")
+            match pktarp.target_hardware_span(a, p)
+                Ok(s)  => test.assert(s.off == 18)
+                Err(_) => test.fail("it follows the sender protocol address")
+            match pktarp.target_protocol_span(a, p)
+                Ok(s)  =>
+                    test.assert(s.off == 24)
+                    test.assert(s.len == 4)
+                Err(_) => test.fail("it is the last field")
+
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+@test
+fn test_the_fixed_fields() [io]
+    let a = request()
+    match pktarp.parse(a, pktspan.whole(a))
+        Ok(p)  =>
+            test.case("hardware type 1 is Ethernet")
+            match pktarp.hardware_type(a, p)
+                Ok(t)  => test.assert(t == 1)
+                Err(_) => test.fail("the fixture says 1")
+
+            test.case("protocol type 0x0800 is IPv4, in the ethertype numbering")
+            match pktarp.protocol_type(a, p)
+                Ok(t)  => test.assert(t == 0x0800)
+                Err(_) => test.fail("the fixture says 0x0800")
+
+            test.case("and the operation is a request")
+            match pktarp.operation(a, p)
+                Ok(PktArpRequest) => test.assert(true)
+                Ok(_)             => test.fail("operation 1 is a request")
+                Err(_)            => test.fail("the fixture carries an operation")
+
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+    test.case("the operations round-trip through their numbers")
+    test.assert(pktarp.operation_code(PktArpRequest) == 1)
+    test.assert(pktarp.operation_code(PktArpReply) == 2)
+    test.assert(pktarp.operation_code(PktArpOther(8)) == 8)
+    test.assert(pktarp.operation_name(PktArpReply) == "reply")
+
+@test
+fn test_an_address_accessor_refuses_a_packet_that_is_not_ipv4() [io]
+    // Reading four bytes of a sixteen-byte address would produce an
+    // address that looks entirely plausible and is not one.
+    test.case("the checking form refuses it, naming the two lengths")
+    let n = not_ipv4()
+    match pktarp.parse(n, pktspan.whole(n))
+        Ok(p)  =>
+            match pktarp.sender_ipv4_span(n, p)
+                Ok(_)                      => test.fail("0x86DD is not IPv4")
+                Err(PktBadArpShape(h, pl)) =>
+                    test.assert(h == 6)
+                    test.assert(pl == 4)
+                Err(_)                     => test.fail("wrong reason for a non-IPv4 packet")
+            match pktarp.target_ipv4_span(n, p)
+                Ok(_)  => test.fail("0x86DD is not IPv4")
+                Err(_) => test.assert(true)
+        Err(_) => test.fail("RFC 826 permits any protocol type")
+
+    test.case("and the total form answers the zero address, because it cannot report")
+    match pktarp.parse(n, pktspan.whole(n))
+        Ok(p)  => test.assert(pktarp.sender_ipv4(n, p).to_int() == 0)
+        Err(_) => test.fail("RFC 826 permits any protocol type")
+
+@test
+fn test_the_addresses_are_ipaddr_nvs_own_type() [io]
+    let a = request()
+    match pktarp.parse(a, pktspan.whole(a))
+        Ok(p)  =>
+            test.case("the sender is 10.0.0.1")
+            test.assert(pktarp.sender_ipv4(a, p).to_int() == 0x0A000001)
+
+            test.case("and the target is 10.0.0.2")
+            test.assert(pktarp.target_ipv4(a, p).to_int() == 0x0A000002)
+
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+@test
+fn test_a_probe_and_an_announcement_are_different_packets() [io]
+    // RFC 5227 section 2.1.1: a host about to claim an address probes
+    // with a ZERO sender address, so the probe does not populate
+    // anyone's cache with a mapping that may be withdrawn.
+    let a = request()
+    match pktarp.parse(a, pktspan.whole(a))
+        Ok(p)  =>
+            test.case("the fixture asks about a different address, so neither")
+            match pktarp.is_gratuitous(a, p)
+                Ok(g)  => test.assert(not g)
+                Err(_) => test.fail("both protocol addresses are readable")
+            match pktarp.is_probe(a, p)
+                Ok(b)  => test.assert(not b)
+                Err(_) => test.fail("both protocol addresses are readable")
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+    test.case("a probe has a zero sender protocol address")
+    var probe = request()
+    probe = bytes.set_u32_be(probe, 14, 0)
+    match pktarp.parse(probe, pktspan.whole(probe))
+        Ok(p)  =>
+            match pktarp.is_probe(probe, p)
+                Ok(b)  => test.assert(b)
+                Err(_) => test.fail("both protocol addresses are readable")
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+    test.case("and a gratuitous ARP names the same address twice")
+    var announce = request()
+    announce = bytes.set_u32_be(announce, 24, 0x0A000001)
+    match pktarp.parse(announce, pktspan.whole(announce))
+        Ok(p)  =>
+            match pktarp.is_gratuitous(announce, p)
+                Ok(g)  => test.assert(g)
+                Err(_) => test.fail("both protocol addresses are readable")
+        Err(_) => test.fail("the fixture is a well-formed packet")
+
+@test
+fn test_building_the_only_pair_anybody_sends() [io]
+    test.case("twenty-eight bytes, hardware type 1 and protocol type 0x0800")
+    match pktarp.build(PktArpRequest, mac(), ip.ipv4(10, 0, 0, 1),
+                       bytes.zeros(6), ip.ipv4(10, 0, 0, 2))
+        Ok(b)  => test.assert(bytes.len(b) == 28)
+        Err(_) => test.fail("two six-byte addresses build an ARP packet")
+
+    test.case("and an address that is not six bytes is refused")
+    match pktarp.build(PktArpReply, bytes.zeros(4), ip.ipv4(10, 0, 0, 1),
+                       mac(), ip.ipv4(10, 0, 0, 2))
+        Ok(_)  => test.fail("an Ethernet address is six bytes")
+        Err(_) => test.assert(true)

@@ -1,0 +1,211 @@
+// pkticmp_tests.nv — two protocols with one header shape and two
+// registries.
+//
+// RED ON PURPOSE.  What is asserted is that ICMPv6 decides "error" with
+// one bit and ICMP for IPv4 with a list, that the rest field is
+// answered raw, and that only ICMPv6 takes a pseudo-header.
+
+use std.test
+use std.bytes
+use ip
+use pktspan
+use pkticmp
+use pktsum
+
+// An ICMP echo request: type 8, code 0, identifier 1, sequence 1, and
+// eight bytes of data.
+fn echo() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01]),
+        bytes.zeros(8)])
+
+// An ICMPv6 echo request: type 128, code 0, identifier 1, sequence 1.
+fn echo6() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01]),
+        bytes.zeros(8)])
+
+// An ICMP destination unreachable, code 4 — fragmentation needed — with
+// the next hop's maximum transmission unit in the low half of the rest
+// field and a twenty-byte IPv4 header behind it.
+fn unreachable() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x05, 0xDC]),
+        bytes.from_byte_list([0x45, 0x00, 0x00, 0x1C, 0x1C, 0x46, 0x40, 0x00,
+                              0x40, 0x11, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+                              0x0A, 0x00, 0x00, 0x02]),
+        bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00])])
+
+@test
+fn test_icmpv6_decides_error_with_one_bit_and_icmp_with_a_list() [io]
+    // RFC 4443 section 2.1 splits the type space in half so that a
+    // receiver meeting an unknown type still knows not to answer it
+    // with another error.
+    test.case("ICMPv6: 0 to 127 are errors")
+    test.assert(pkticmp.icmpv6_is_error(1))
+    test.assert(pkticmp.icmpv6_is_error(2))
+    test.assert(pkticmp.icmpv6_is_error(127))
+
+    test.case("ICMPv6: 128 to 255 are informational")
+    test.assert(not pkticmp.icmpv6_is_error(128))
+    test.assert(not pkticmp.icmpv6_is_error(135))
+    test.assert(not pkticmp.icmpv6_is_error(255))
+
+    test.case("ICMP for IPv4 has no such rule — the error types are a list")
+    test.assert(pkticmp.icmp_is_error(3))
+    test.assert(pkticmp.icmp_is_error(11))
+    test.assert(not pkticmp.icmp_is_error(0))
+    test.assert(not pkticmp.icmp_is_error(8))
+
+    test.case("so the two functions disagree on the same number, as they must")
+    test.assert(pkticmp.icmpv6_is_error(1))
+    test.assert(not pkticmp.icmp_is_error(1))
+
+@test
+fn test_the_two_registries_name_the_same_number_differently() [io]
+    test.case("type 1 is an echo reply in neither and destination unreachable in one")
+    test.assert(pkticmp.icmp_type_name(0) == "echo-reply")
+    test.assert(pkticmp.icmp_type_name(8) == "echo-request")
+    test.assert(pkticmp.icmpv6_type_name(128) == "echo-request")
+    test.assert(pkticmp.icmpv6_type_name(135) == "neighbour-solicitation")
+
+@test
+fn test_the_echo_fields_come_out_of_an_overloaded_rest_field() [io]
+    let e = echo()
+    match pkticmp.parse(e, pktspan.whole(e))
+        Ok(m)  =>
+            test.case("the type and the code")
+            match pkticmp.icmp_type(e, m)
+                Ok(t)  => test.assert(t == 8)
+                Err(_) => test.fail("the fixture is an echo request")
+            match pkticmp.icmp_code(e, m)
+                Ok(c)  => test.assert(c == 0)
+                Err(_) => test.fail("an echo request has code zero")
+
+            test.case("the checksum field, as a value")
+            match pkticmp.icmp_checksum(e, m)
+                Ok(c)  => test.assert(c == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+
+            test.case("the rest field raw, because its meaning depends on the type")
+            match pkticmp.icmp_rest(e, m)
+                Ok(r)  => test.assert(r == 0x00010001)
+                Err(_) => test.fail("the fixture carries one")
+
+            test.case("and its two halves on an echo")
+            match pkticmp.icmp_identifier(e, m)
+                Ok(i)  => test.assert(i == 1)
+                Err(_) => test.fail("an echo has an identifier")
+            match pkticmp.icmp_sequence(e, m)
+                Ok(s)  => test.assert(s == 1)
+                Err(_) => test.fail("an echo has a sequence number")
+
+            test.case("the body is everything past the eight-byte header")
+            match pkticmp.icmp_payload_span(e, m)
+                Ok(s)  => test.assert(s.len == 8)
+                Err(_) => test.fail("the fixture carries eight bytes of data")
+
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+@test
+fn test_an_error_carries_the_datagram_that_caused_it() [io]
+    // RFC 792 requires the IP header and the first eight bytes after
+    // it, which is enough for the ports.  That is what makes an error
+    // attributable to a flow.
+    let u = unreachable()
+    match pkticmp.parse(u, pktspan.whole(u))
+        Ok(m)  =>
+            test.case("code 4 is fragmentation needed, which path MTU discovery needs")
+            match pkticmp.icmp_code(u, m)
+                Ok(c)  => test.assert(c == 4)
+                Err(_) => test.fail("the fixture is code 4")
+
+            test.case("the next hop's maximum transmission unit is in the rest field")
+            match pkticmp.icmp_rest(u, m)
+                Ok(r)  => test.assert(r == 1500)
+                Err(_) => test.fail("the fixture carries 1500")
+
+            test.case("and the embedded datagram starts after the eight-byte header")
+            match pkticmp.icmp_embedded_span(u, m)
+                Ok(s)  =>
+                    test.assert(s.off == 8)
+                    test.assert(s.len == 28)
+                Err(_) => test.fail("an error carries the offending datagram")
+
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+    test.case("an echo request is not an error and has no embedded datagram")
+    let e = echo()
+    match pkticmp.parse(e, pktspan.whole(e))
+        Ok(m)  =>
+            match pkticmp.icmp_embedded_span(e, m)
+                Ok(_)  => test.fail("an echo request caused nothing")
+                Err(_) => test.assert(true)
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+@test
+fn test_only_icmpv6_takes_a_pseudo_header() [io]
+    // RFC 4443 section 2.3 makes the ICMPv6 checksum mandatory and
+    // pseudo-header-covered; RFC 792's covers the message alone.
+    let e = echo()
+    test.case("the IPv4 verifier is given no addresses at all")
+    match pkticmp.parse(e, pktspan.whole(e))
+        Ok(m)  =>
+            match pkticmp.verify_checksum(e, m)
+                Ok(c)  => test.assert(not pktsum.is_valid(c) or pktsum.is_valid(c))
+                Err(_) => test.fail("the whole message is present")
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+    test.case("and the ICMPv6 one cannot be called without them")
+    let e6 = echo6()
+    let p = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 16)
+    match pkticmp.parse_v6(e6, pktspan.whole(e6))
+        Ok(m)  =>
+            match pkticmp.verify_checksum_v6(e6, m, p)
+                Ok(PktChecksumAbsent) => test.fail("ICMPv6 has no optional checksum")
+                Ok(_)                 => test.assert(true)
+                Err(_)                => test.fail("the whole message is present")
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+@test
+fn test_the_icmpv6_accessors_read_the_same_four_bytes() [io]
+    let e6 = echo6()
+    match pkticmp.parse_v6(e6, pktspan.whole(e6))
+        Ok(m)  =>
+            match pkticmp.icmpv6_type(e6, m)
+                Ok(t)  => test.assert(t == 128)
+                Err(_) => test.fail("the fixture is an echo request")
+            match pkticmp.icmpv6_code(e6, m)
+                Ok(c)  => test.assert(c == 0)
+                Err(_) => test.fail("an echo request has code zero")
+            match pkticmp.icmpv6_checksum(e6, m)
+                Ok(c)  => test.assert(c == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+            match pkticmp.icmpv6_rest(e6, m)
+                Ok(r)  => test.assert(r == 0x00010001)
+                Err(_) => test.fail("the fixture carries one")
+            match pkticmp.icmpv6_payload_span(e6, m)
+                Ok(s)  => test.assert(s.len == 8)
+                Err(_) => test.fail("the fixture carries eight bytes")
+            match pkticmp.icmpv6_embedded_span(e6, m)
+                Ok(_)  => test.fail("an echo request caused nothing")
+                Err(_) => test.assert(true)
+        Err(_) => test.fail("the fixture is a well-formed message")
+
+@test
+fn test_building_the_two_forms() [io]
+    test.case("an ICMP message is eight bytes plus its body")
+    match pkticmp.build(8, 0, 0x00010001, bytes.zeros(56))
+        Ok(b)  => test.assert(bytes.len(b) == 64)
+        Err(_) => test.fail("fifty-six bytes of data build a sixty-four byte message")
+
+    test.case("and an ICMPv6 one needs the addresses its checksum covers")
+    let p = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 16)
+    match pkticmp.build_v6(128, 0, 0x00010001, bytes.zeros(8), p)
+        Ok(b)  => test.assert(bytes.len(b) == 16)
+        Err(_) => test.fail("eight bytes of data build a sixteen-byte message")
+
+    test.case("a type above 255 does not fit its field")
+    match pkticmp.build(256, 0, 0, bytes.zeros(0))
+        Ok(_)  => test.fail("a type is one byte")
+        Err(_) => test.assert(true)

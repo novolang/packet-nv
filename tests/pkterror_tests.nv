@@ -1,0 +1,59 @@
+// pkterror_tests.nv — the division that matters when the bytes came
+// from a capture.
+//
+// RED ON PURPOSE.  What is asserted is that truncation, malformation
+// and a caller's own mistake are three groups with three responses,
+// and that a metric label carries nothing a packet chose.
+
+use std.test
+use pkterror
+
+@test
+fn test_truncated_is_not_malformed() [io]
+    // A capture with a snapshot length of 96 bytes truncates every
+    // full-sized frame.  Counting that as corruption reports a working
+    // link as broken.
+    test.case("truncation is the recording's fault")
+    test.assert(pkterror.is_truncation(PktTruncated("ipv4", 20, 14)))
+    test.assert(not pkterror.is_malformed(PktTruncated("ipv4", 20, 14)))
+
+    test.case("a wrong version is the packet's")
+    test.assert(pkterror.is_malformed(PktBadVersion(4, 6)))
+    test.assert(not pkterror.is_truncation(PktBadVersion(4, 6)))
+
+    test.case("and a bad option is the packet's too — it is the loop shape")
+    test.assert(pkterror.is_malformed(PktBadOption(8, "length 1")))
+    test.assert(pkterror.is_malformed(PktBadChecksum(0x1234, 0)))
+    test.assert(pkterror.is_malformed(PktBadArpShape(6, 16)))
+    test.assert(pkterror.is_malformed(PktBadLength("total_length", 0)))
+
+@test
+fn test_three_reasons_are_the_callers_own_bug() [io]
+    // None of the three can be produced by any packet.  A tool logging
+    // them beside the packet faults is logging its own bugs as network
+    // events.
+    test.case("a span read against the wrong buffer")
+    test.assert(pkterror.is_caller_fault(PktSpanOutOfRange(0, 64, 40)))
+    test.assert(not pkterror.is_malformed(PktSpanOutOfRange(0, 64, 40)))
+
+    test.case("a header asked for that this packet does not carry")
+    test.assert(pkterror.is_caller_fault(PktNoSuchLayer("tcp", "udp")))
+
+    test.case("a value handed to a builder that its field cannot hold")
+    test.assert(pkterror.is_caller_fault(PktFieldOutOfRange("vlan_id", 4096, 4094)))
+
+    test.case("and truncation is in none of the three")
+    test.assert(not pkterror.is_caller_fault(PktTruncated("tcp", 20, 12)))
+
+@test
+fn test_a_metric_label_carries_nothing_a_packet_chose() [io]
+    // Putting a message in a label would put an attacker-chosen length
+    // into a time series database: unbounded series from one crafted
+    // packet.
+    test.case("the code is short and stable")
+    test.assert(pkterror.code(PktTruncated("ipv6", 40, 20)) == "truncated")
+    test.assert(pkterror.code(PktBadChecksum(1, 2)) == "bad_checksum")
+
+    test.case("the message carries the numbers, for a log and not a label")
+    test.assert(pkterror.code(PktExtChainTooLong(64, 16)) == "ext_chain_too_long")
+    test.assert(PktTruncated("ipv4", 20, 14).message() != "")

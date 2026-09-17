@@ -1,0 +1,202 @@
+// pktipv4_tests.nv — the three lengths, the option walk, and what a
+// fragment does and does not carry.
+//
+// RED ON PURPOSE.  The fixture is the twenty-byte header of RFC 791
+// section 3.1 with a total length of twenty-eight and an option-free
+// internet header length of five.
+
+use std.test
+use std.bytes
+use pktspan
+use pktipv4
+
+// An IPv4 header: version 4, IHL 5, total length 28, identification
+// 0x1C46, don't-fragment set, TTL 64, protocol UDP, and 10.0.0.1 to
+// 10.0.0.2 — with an eight-byte UDP header behind it.
+fn datagram() -> Bytes
+    bytes.from_byte_list(
+        [0x45, 0x00, 0x00, 0x1C, 0x1C, 0x46, 0x40, 0x00,
+         0x40, 0x11, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+         0x0A, 0x00, 0x00, 0x02, 0x04, 0xD2, 0x00, 0x35,
+         0x00, 0x08, 0x00, 0x00])
+
+// The same datagram in a padded Ethernet frame's payload position:
+// twenty-eight bytes of datagram and eighteen of padding.
+fn padded() -> Bytes
+    bytes.concat([datagram(), bytes.zeros(18)])
+
+@test
+fn test_the_total_length_and_not_the_buffer_says_where_it_ends() [io]
+    // An Ethernet frame is padded to sixty bytes.  A parser that took
+    // the payload to the end of the buffer hands the padding to the
+    // application.
+    test.case("a whole datagram parses")
+    match pktipv4.parse(datagram(), pktspan.whole(datagram()))
+        Ok(h)  =>
+            test.assert(h.header.len == 20)
+            test.assert(h.payload.len == 8)
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+    test.case("and eighteen bytes of padding do not become payload")
+    match pktipv4.parse(padded(), pktspan.whole(padded()))
+        Ok(h)  => test.assert(h.payload.len == 8)
+        Err(_) => test.fail("padding behind a datagram is not part of it")
+
+    test.case("a total length longer than the span is truncation")
+    match pktipv4.parse(bytes.slice(datagram(), 0, 22), pktspan.span(0, 22))
+        Ok(_)                      => test.fail("28 bytes are claimed and 22 are present")
+        Err(PktTruncated(_, _, _)) => test.assert(true)
+        Err(_)                     => test.fail("a short capture is truncation, not malformation")
+
+@test
+fn test_a_zero_total_length_is_a_local_capture_and_not_a_wire_packet() [io]
+    // Segmentation offload: the network card has not written the
+    // length yet.  It is most of a busy server's own outgoing traffic.
+    let offloaded = bytes.set_u16_be(datagram(), 2, 0)
+
+    test.case("`parse` refuses it — a length of zero is not a length")
+    match pktipv4.parse(offloaded, pktspan.whole(offloaded))
+        Ok(_)                   => test.fail("zero is not a total length")
+        Err(PktBadLength(f, v)) =>
+            test.assert(f == "total_length")
+            test.assert(v == 0)
+        Err(_)                  => test.fail("wrong reason for a zero total length")
+
+    test.case("and `parse_offloaded` takes it, with the payload to the end")
+    match pktipv4.parse_offloaded(offloaded, pktspan.whole(offloaded))
+        Ok(h)  => test.assert(h.payload.len == 8)
+        Err(_) => test.fail("a local capture of an offloaded send is readable")
+
+@test
+fn test_the_fields_are_read_in_the_units_a_caller_wants() [io]
+    let d = datagram()
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("the version is 4, which parse already checked")
+            match pktipv4.version(d, h)
+                Ok(v)  => test.assert(v == 4)
+                Err(_) => test.fail("the fixture is IPv4")
+
+            test.case("the header length is in BYTES and not in words")
+            match pktipv4.header_length(d, h)
+                Ok(n)  => test.assert(n == 20)
+                Err(_) => test.fail("an IHL of 5 is twenty bytes")
+
+            test.case("the total length is the header and the payload")
+            match pktipv4.total_length(d, h)
+                Ok(n)  => test.assert(n == 28)
+                Err(_) => test.fail("the fixture says 28")
+
+            test.case("the identification is what groups fragments")
+            match pktipv4.identification(d, h)
+                Ok(n)  => test.assert(n == 0x1C46)
+                Err(_) => test.fail("the fixture carries an identification")
+
+            test.case("the time to live is a hop count")
+            match pktipv4.ttl(d, h)
+                Ok(n)  => test.assert(n == 64)
+                Err(_) => test.fail("the fixture says 64")
+
+            test.case("the type-of-service byte splits into two fields")
+            match pktipv4.dscp(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries a zero byte")
+            match pktipv4.ecn(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries a zero byte")
+
+            test.case("and the checksum field is a value, not a verdict")
+            match pktipv4.checksum(d, h)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture carries a zero checksum")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_both_fragment_bits_are_needed_and_the_offset_is_in_bytes() [io]
+    // The last fragment has more-fragments CLEAR and a non-zero
+    // offset.  A program testing only the flag treats it as a whole
+    // datagram and parses the middle of a payload as a transport
+    // header.
+    let d = datagram()
+
+    test.case("don't-fragment is what path MTU discovery sets")
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            match pktipv4.dont_fragment(d, h)
+                Ok(f)  => test.assert(f)
+                Err(_) => test.fail("the fixture sets the bit")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+    test.case("an unfragmented datagram is not a fragment")
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            match pktipv4.is_fragment(d, h)
+                Ok(f)  => test.assert(not f)
+                Err(_) => test.fail("the fixture is whole")
+            match pktipv4.more_fragments(d, h)
+                Ok(f)  => test.assert(not f)
+                Err(_) => test.fail("the fixture is whole")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+    test.case("the offset is multiplied by eight, because the field counts eights")
+    // Flags and fragment offset 0x00B9: more-fragments set, offset 185
+    // eight-byte units, which is 1480 bytes.
+    let frag = bytes.set_u16_be(d, 6, 0x20B9)
+    match pktipv4.parse(frag, pktspan.whole(frag))
+        Ok(h)  =>
+            match pktipv4.fragment_offset(frag, h)
+                Ok(n)  => test.assert(n == 1480)
+                Err(_) => test.fail("185 units is 1480 bytes")
+        Err(_) => test.fail("a fragment is a well-formed datagram")
+
+    test.case("and only the first fragment carries the transport header")
+    match pktipv4.parse(frag, pktspan.whole(frag))
+        Ok(h)  =>
+            match pktipv4.has_transport_header(frag, h)
+                Ok(f)  => test.assert(not f)
+                Err(_) => test.fail("a fragment at offset 1480 carries payload")
+        Err(_) => test.fail("a fragment is a well-formed datagram")
+
+@test
+fn test_the_option_walk_refuses_the_two_lengths_that_loop() [io]
+    // A length byte of 0 or 1 makes a walk stand still or step
+    // backwards, which is an infinite loop from a packet anybody can
+    // send.
+    test.case("an internet header length of 5 means an empty option area")
+    let d = datagram()
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.assert(pktspan.is_empty(h.options))
+            match pktipv4.options(d, h)
+                Ok(os) => test.assert(list.len(os) == 0)
+                Err(_) => test.fail("an empty option area walks to an empty list")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+    test.case("the type byte is three fields, and a filter compares the number")
+    // Record route is number 7; with the copied bit set it is 0x87, and
+    // a program comparing the whole byte against 7 never finds it.
+    test.assert(pktipv4.option_name(7) == "rr")
+    test.assert(pktipv4.option_name(0) == "eool")
+    test.assert(pktipv4.option_name(1) == "nop")
+
+@test
+fn test_the_addresses_are_ipaddr_nvs_own_type() [io]
+    // A caller comparing a source against a configured prefix hands it
+    // to `Net4.contains` rather than re-encoding it through bytes.
+    let d = datagram()
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("the source is 10.0.0.1")
+            test.assert(pktipv4.source(d, h).to_int() == 0x0A000001)
+
+            test.case("the destination is 10.0.0.2")
+            test.assert(pktipv4.destination(d, h).to_int() == 0x0A000002)
+
+            test.case("and both are also readable as spans, bounds-checked")
+            test.assert(pktipv4.source_span(h).off == 12)
+            test.assert(pktipv4.source_span(h).len == 4)
+            test.assert(pktipv4.destination_span(h).off == 16)
+            test.assert(pktipv4.payload(h).off == 20)
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")

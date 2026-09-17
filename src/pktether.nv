@@ -1,0 +1,580 @@
+// pktether.nv — Ethernet II frames, the VLAN tags that can be stacked
+// in front of the ethertype, and the two ways the same two bytes are
+// read.
+//
+// THE FIELD AFTER THE ADDRESSES IS NOT ALWAYS A TYPE
+//
+// An Ethernet II frame is six bytes of destination address, six of
+// source, and two more.  Those two are an ethertype when their value
+// is 1536 or above and a LENGTH when it is 1500 or below (IEEE 802.3
+// clause 3.2.6; the values between are undefined and do not appear).
+// A frame whose field reads 0x0026 is an 802.3 frame carrying
+// thirty-eight bytes and an 802.2 header, not a frame of ethertype 38.
+//
+// The distinction still matters on a modern network because Spanning
+// Tree, the Cisco discovery protocols and a good deal of industrial
+// equipment send 802.3 frames.  `length_or_type` answers the raw field
+// and `is_ethertype` is the one comparison, so a program that only
+// handles ethertypes can say so instead of misreading the rest.
+//
+// VLAN TAGS STACK
+//
+// IEEE 802.1Q inserts four bytes in front of the ethertype: two of tag
+// protocol identifier, which is 0x8100, and two holding a three-bit
+// priority, a drop-eligible bit and a twelve-bit VLAN identifier.
+// IEEE 802.1ad stacks a second tag in front of the first, with a tag
+// protocol identifier of 0x88A8 on the outer one — which is why the
+// tag count is not a boolean and why the ethertype is not at a fixed
+// offset.
+//
+// A parser that assumed one tag reads the inner tag protocol
+// identifier as an ethertype on every double-tagged frame, and a
+// parser that assumed none reads 0x8100 as an ethertype on every
+// tagged frame.  Neither fails loudly.  `parse` walks the chain,
+// `tag_count` says how many it found, and `ethertype` answers the
+// value at the end of it.
+//
+// PADDING IS NOT PAYLOAD
+//
+// A frame is padded to sixty bytes on the wire (IEEE 802.3 section
+// 4.2.3.3), so the payload span this module answers runs to the end of
+// the frame and includes any padding.  It has to: Ethernet carries no
+// length for an ethertype frame.  The layer above is what knows where
+// its data stops, which is why `pktipv4.parse` narrows the payload to
+// the IP total length and `pktudp.parse` narrows it again.  A program
+// that handed this payload span straight to an application would hand
+// it the padding too.
+
+// An Ethernet frame, as spans into the caller's buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     match pktether.parse(bytes.zeros(64), pktspan.whole(bytes.zeros(64)))
+//         Ok(e)  => println("${pktether.tag_count(e)}")
+//         Err(x) => println(x.message())
+// ```
+pub struct PktEthernet
+    // The whole frame, from the destination address to the last byte
+    // the caller gave.
+    frame: PktSpan
+    // The header: the two addresses, every VLAN tag, and the
+    // ethertype.  Fourteen bytes with no tags, eighteen with one,
+    // twenty-two with two.
+    header: PktSpan
+    // Everything after the ethertype, INCLUDING any padding the
+    // sender added to reach the minimum frame size.  The layer above
+    // is what says where its own data ends.
+    payload: PktSpan
+    // How many VLAN tags sit between the source address and the
+    // ethertype.  Zero, one for 802.1Q, two for 802.1ad.
+    tag_count: Int
+
+// One VLAN tag, as a span over the four bytes it occupies.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  => println("${v.span.len}")
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub struct PktVlan
+    // The four bytes of the tag: two of tag protocol identifier and
+    // two of tag control information.
+    span: PktSpan
+
+// A VLAN tag as a value, for building rather than reading.
+//
+// The parse side answers `PktVlan`, which is a view.  The build side
+// takes this, which is the four fields.  They are separate types
+// because the two directions want different things: a reader wants to
+// know where the bytes are, a writer has no bytes yet.
+//
+// ```novo
+// use pktether
+//
+// fn main() [io]
+//     match pktether.vlan_tag(0x8100, 3, false, 100)
+//         Ok(t)  => println("${t.id}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktVlanTag
+    // The tag protocol identifier: 0x8100 for an 802.1Q tag, 0x88A8
+    // for the outer tag of an 802.1ad stack.
+    tpid: Int
+    // The priority code point, 0 to 7 (IEEE 802.1p).
+    priority: Int
+    // The drop-eligible indicator.  One bit, and it was the
+    // canonical-format indicator before 802.1ad reused it.
+    drop_eligible: Bool
+    // The VLAN identifier, 0 to 4094.  4095 is reserved and 0 means
+    // "no VLAN, priority only".
+    id: Int
+
+// Read an Ethernet frame out of a span.
+//
+// Requires fourteen bytes, and four more for every VLAN tag it finds.
+// Follows the tag chain: a tag protocol identifier of 0x8100 or
+// 0x88A8 means four more bytes of tag before the ethertype.  Stops
+// after two tags, because a third is not a frame any standard
+// describes and following an unbounded chain is how a crafted frame
+// walks a parser off the end.
+//
+// `PktTruncated` when the span is shorter than the header the tags
+// imply.  The payload runs to the end of the span, padding included.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  => println("${e.header.len}")
+//         Err(x) => println(x.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktEthernet, PktError>
+    todo("packet-nv.pktether.parse")
+
+// The six bytes of the destination address, as a span.
+//
+// A span rather than a `Bytes`, so that reading the address of every
+// frame in a capture allocates nothing.  `pktspan.bytes_of` is the
+// call that makes a copy, for a caller that wants one as a map key.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  => println("${pktether.destination_span(e).off}")
+//         Err(x) => println(x.message())
+// ```
+pub fn destination_span(e: PktEthernet) -> PktSpan
+    todo("packet-nv.pktether.destination_span")
+
+// The six bytes of the source address, as a span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  => println("${pktether.source_span(e).off}")
+//         Err(x) => println(x.message())
+// ```
+pub fn source_span(e: PktEthernet) -> PktSpan
+    todo("packet-nv.pktether.source_span")
+
+// Whether a destination address is a multicast one.
+//
+// The low bit of the FIRST byte, which is the one transmitted first on
+// the wire (IEEE 802.3 section 3.2.3).  A broadcast address is a
+// multicast address with every other bit set as well.  It takes the
+// buffer and a span rather than a parsed frame, so it also answers for
+// an address read out of an ARP packet.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     match pktether.is_multicast(bytes.zeros(64), pktspan.span(0, 6))
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn is_multicast(buf: Bytes, address: PktSpan) -> Result<Bool, PktError>
+    todo("packet-nv.pktether.is_multicast")
+
+// Whether an address is the broadcast address, `ff:ff:ff:ff:ff:ff`.
+//
+// What an ARP request and a DHCP discover are sent to.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     match pktether.is_broadcast(bytes.zeros(64), pktspan.span(0, 6))
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn is_broadcast(buf: Bytes, address: PktSpan) -> Result<Bool, PktError>
+    todo("packet-nv.pktether.is_broadcast")
+
+// An address in the usual `aa:bb:cc:dd:ee:ff` form, lowercase.
+//
+// For a display.  It allocates a `Str`, so a capture walk that formats
+// every address is doing per-packet work the span design was there to
+// avoid.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     match pktether.address_text(bytes.zeros(64), pktspan.span(0, 6))
+//         Ok(s)  => println(s)
+//         Err(e) => println(e.message())
+// ```
+pub fn address_text(buf: Bytes, address: PktSpan) -> Result<Str, PktError>
+    todo("packet-nv.pktether.address_text")
+
+// The raw two bytes after the addresses and the tags, whatever they
+// mean.
+//
+// An ethertype when it is 1536 or above, a payload length when it is
+// 1500 or below.  `is_ethertype` is the test; this function does not
+// make the decision for the caller, because a program that only reads
+// IP traffic and a program that also reads Spanning Tree want
+// different things from an 802.3 frame.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.length_or_type(buf, e)
+//                 Ok(v)  => println("${v}")
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn length_or_type(buf: Bytes, e: PktEthernet) -> Result<Int, PktError>
+    todo("packet-nv.pktether.length_or_type")
+
+// Whether a value in that field is an ethertype rather than a length.
+//
+// True at 1536 (0x0600) and above, which is IEEE 802.3 clause 3.2.6's
+// rule.  A pure function of the number, so it also answers for a value
+// a caller read somewhere else.
+//
+// ```novo
+// use pktether
+//
+// fn main() [io]
+//     println("${pktether.is_ethertype(0x0800)}")
+//     println("${pktether.is_ethertype(38)}")
+// ```
+pub fn is_ethertype(value: Int) -> Bool
+    todo("packet-nv.pktether.is_ethertype")
+
+// The ethertype at the end of the tag chain — what the payload is.
+//
+// For an untagged frame this is the field at offset twelve.  For a
+// tagged one it is the field after the last tag, which is the whole
+// reason the chain is walked.  `PktBadLength` when the field is a
+// length rather than a type, because there is no ethertype to answer
+// and answering the length would be answering a number that means
+// something else.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.ethertype(buf, e)
+//                 Ok(v)  => println("${v}")
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn ethertype(buf: Bytes, e: PktEthernet) -> Result<Int, PktError>
+    todo("packet-nv.pktether.ethertype")
+
+// The name of an ethertype: `"ipv4"`, `"arp"`, `"ipv6"`, `"vlan"`,
+// `"qinq"`, `"lldp"`, `"mpls-unicast"`.
+//
+// An unrecognised value answers its own hexadecimal form, so a display
+// never has a blank.
+//
+// ```novo
+// use pktether
+//
+// fn main() [io]
+//     println(pktether.ethertype_name(0x0806))
+// ```
+pub fn ethertype_name(value: Int) -> Str
+    todo("packet-nv.pktether.ethertype_name")
+
+// The frame's payload: everything after the ethertype.
+//
+// Padding included, because Ethernet carries no length for an
+// ethertype frame and only the layer above knows where its data stops.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  => println("${pktether.payload(e).len}")
+//         Err(x) => println(x.message())
+// ```
+pub fn payload(e: PktEthernet) -> PktSpan
+    todo("packet-nv.pktether.payload")
+
+// How many VLAN tags the frame carries: 0, 1 or 2.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  => println("${pktether.tag_count(e)}")
+//         Err(x) => println(x.message())
+// ```
+pub fn tag_count(e: PktEthernet) -> Int
+    todo("packet-nv.pktether.tag_count")
+
+// The VLAN tag at `index`, counting from the outermost.
+//
+// Index 0 is the tag nearest the source address, which under 802.1ad
+// is the service provider's tag and not the customer's.  Getting the
+// order the other way round attributes traffic to the wrong VLAN on
+// every double-tagged frame.  `PktNoSuchLayer` when the index is past
+// the tag count.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  => println("${v.span.off}")
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan(buf: Bytes, e: PktEthernet, index: Int) -> Result<PktVlan, PktError>
+    todo("packet-nv.pktether.vlan")
+
+// A tag's tag protocol identifier: 0x8100 for 802.1Q, 0x88A8 for the
+// outer tag of an 802.1ad stack.
+//
+// Some equipment uses 0x9100 for the outer tag, which predates the
+// standard.  It is answered as it stands rather than normalised.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  =>
+//                     match pktether.vlan_tpid(buf, v)
+//                         Ok(t)  => println("${t}")
+//                         Err(x) => println(x.message())
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan_tpid(buf: Bytes, v: PktVlan) -> Result<Int, PktError>
+    todo("packet-nv.pktether.vlan_tpid")
+
+// A tag's VLAN identifier: the low twelve bits of the tag control
+// information, 0 to 4095.
+//
+// 0 means the tag carries a priority and no VLAN membership, which is
+// a real thing on a link that wants 802.1p without 802.1Q.  4095 is
+// reserved and must not be transmitted.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  =>
+//                     match pktether.vlan_id(buf, v)
+//                         Ok(i)  => println("${i}")
+//                         Err(x) => println(x.message())
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan_id(buf: Bytes, v: PktVlan) -> Result<Int, PktError>
+    todo("packet-nv.pktether.vlan_id")
+
+// A tag's priority code point: the top three bits, 0 to 7 (IEEE
+// 802.1p).
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  =>
+//                     match pktether.vlan_priority(buf, v)
+//                         Ok(p)  => println("${p}")
+//                         Err(x) => println(x.message())
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan_priority(buf: Bytes, v: PktVlan) -> Result<Int, PktError>
+    todo("packet-nv.pktether.vlan_priority")
+
+// A tag's drop-eligible indicator: the bit between the priority and
+// the identifier.
+//
+// It was the canonical-format indicator in the original 802.1Q and was
+// reused by 802.1ad.  On an Ethernet link the old meaning was always
+// zero, so a set bit today means the frame may be discarded first
+// under congestion.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  =>
+//                     match pktether.vlan_drop_eligible(buf, v)
+//                         Ok(d)  => println("${d}")
+//                         Err(x) => println(x.message())
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan_drop_eligible(buf: Bytes, v: PktVlan) -> Result<Bool, PktError>
+    todo("packet-nv.pktether.vlan_drop_eligible")
+
+// A parsed tag as a value, for re-emitting it.
+//
+// The crossing from the read side to the write side: a tool that
+// rewrites one field of a tagged frame reads the tags, changes what it
+// means to change, and hands them back to `build_tagged`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktether
+//
+// fn main() [io]
+//     let buf = bytes.zeros(64)
+//     match pktether.parse(buf, pktspan.whole(buf))
+//         Ok(e)  =>
+//             match pktether.vlan(buf, e, 0)
+//                 Ok(v)  =>
+//                     match pktether.vlan_tag_of(buf, v)
+//                         Ok(t)  => println("${t.tpid}")
+//                         Err(x) => println(x.message())
+//                 Err(x) => println(x.message())
+//         Err(x) => println(x.message())
+// ```
+pub fn vlan_tag_of(buf: Bytes, v: PktVlan) -> Result<PktVlanTag, PktError>
+    todo("packet-nv.pktether.vlan_tag_of")
+
+// A VLAN tag to build with.
+//
+// `PktFieldOutOfRange` for a priority above 7, an identifier above
+// 4094 — 4095 is reserved by IEEE 802.1Q and must not be transmitted —
+// or a tag protocol identifier that does not fit sixteen bits.
+// Refusing rather than masking is what stops an identifier of 4096
+// becoming an identifier of 0, which is a tag that means something
+// else entirely.
+//
+// ```novo
+// use pktether
+//
+// fn main() [io]
+//     match pktether.vlan_tag(0x8100, 5, false, 200)
+//         Ok(t)  => println("${t.priority}")
+//         Err(e) => println(e.message())
+// ```
+pub fn vlan_tag(tpid: Int, priority: Int, drop_eligible: Bool,
+                id: Int) -> Result<PktVlanTag, PktError>
+    todo("packet-nv.pktether.vlan_tag")
+
+// Build an untagged Ethernet II frame.
+//
+// `destination` and `source` must be six bytes each; `PktBadLength`
+// otherwise.  No padding is added: a frame shorter than sixty bytes is
+// padded by the sending hardware, and a tool writing a capture file
+// wants the frame it was given rather than one this package extended.
+//
+// ```novo
+// use std.bytes
+// use pktether
+//
+// fn main() [io]
+//     let mac = bytes.from_byte_list([0, 0, 0, 0, 0, 1])
+//     match pktether.build(mac, mac, 0x0800, bytes.zeros(20))
+//         Ok(f)  => println("${bytes.len(f)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(destination: Bytes, source: Bytes, ethertype: Int,
+             payload: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pktether.build")
+
+// Build a frame with VLAN tags in front of the ethertype.
+//
+// `tags` is ordered outermost first, the same order `vlan` indexes.
+// An empty list builds what `build` builds.  More than two tags is
+// `PktFieldOutOfRange`, matching what `parse` will read back.
+//
+// ```novo
+// use std.bytes
+// use pktether
+//
+// fn main() [io]
+//     let mac = bytes.from_byte_list([0, 0, 0, 0, 0, 1])
+//     match pktether.vlan_tag(0x8100, 0, false, 42)
+//         Ok(t)  =>
+//             match pktether.build_tagged(mac, mac, [t], 0x0800, bytes.zeros(20))
+//                 Ok(f)  => println("${bytes.len(f)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn build_tagged(destination: Bytes, source: Bytes, tags: [PktVlanTag], ethertype: Int,
+                    payload: Bytes) -> Result<Bytes, PktError>
+    todo("packet-nv.pktether.build_tagged")

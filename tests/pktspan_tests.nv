@@ -1,0 +1,133 @@
+// pktspan_tests.nv — the span rules, which every other module rests on.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches `not
+// implemented: packet-nv.pktspan.<fn>`.  What is asserted is that a
+// span is a view and not a copy, that narrowing is what keeps Ethernet
+// padding out of a payload, and that the one allocating call is the
+// one named `bytes_of`.
+
+use std.test
+use std.bytes
+use pktspan
+
+// A minimum-size Ethernet frame: fourteen bytes of header, an IPv4
+// datagram of twenty-eight bytes, and eighteen bytes of padding to
+// reach the sixty the standard requires (IEEE 802.3 section 4.2.3.3).
+fn padded_frame() -> Bytes
+    bytes.zeros(60)
+
+@test
+fn test_a_span_is_an_offset_and_a_length_and_nothing_else() [io]
+    test.case("a span carries no reference to a buffer")
+    let s = pktspan.span(14, 20)
+    test.assert(s.off == 14)
+    test.assert(s.len == 20)
+
+    test.case("so `end` is arithmetic and needs no buffer")
+    test.assert(pktspan.end(pktspan.span(14, 20)) == 34)
+
+    test.case("and `whole` is where a walk starts")
+    test.assert(pktspan.whole(padded_frame()).len == 60)
+
+    test.case("an empty span is legal: a bare acknowledgement has one")
+    test.assert(pktspan.is_empty(pktspan.span(34, 0)))
+    test.assert(not pktspan.is_empty(pktspan.span(34, 1)))
+
+@test
+fn test_the_one_check_a_span_can_make_is_whether_it_fits() [io]
+    // A span used with the WRONG buffer of the same size cannot be
+    // detected at all.  This is the only mistake that can be.
+    test.case("a span inside the buffer fits")
+    test.assert(pktspan.fits(padded_frame(), pktspan.span(14, 20)))
+
+    test.case("one that ends past it does not")
+    test.assert(not pktspan.fits(padded_frame(), pktspan.span(50, 20)))
+
+    test.case("and a negative offset does not")
+    test.assert(not pktspan.fits(padded_frame(), pktspan.span(0 - 1, 4)))
+
+    test.case("reading through one that does not fit is PktSpanOutOfRange")
+    match pktspan.u8_at(padded_frame(), pktspan.span(50, 20), 0)
+        Err(PktSpanOutOfRange(_, _, n)) => test.assert(n == 60)
+        Err(_)                          => test.fail("wrong reason for a span past the buffer")
+        Ok(_)                           => test.fail("a span past the buffer cannot be read")
+
+@test
+fn test_narrowing_is_what_keeps_padding_out_of_a_payload() [io]
+    // A four-byte UDP payload in a padded frame sits in a span that
+    // runs to byte sixty.  The IP total length says where the datagram
+    // ends; the buffer does not.
+    test.case("narrowing shortens a span to a length field's value")
+    match pktspan.narrowed(pktspan.span(14, 46), 28)
+        Ok(s)  =>
+            test.assert(s.off == 14)
+            test.assert(s.len == 28)
+        Err(_) => test.fail("28 fits inside 46")
+
+    test.case("narrowing to more than is present is out of range — truncation")
+    match pktspan.narrowed(pktspan.span(14, 46), 100)
+        Ok(_)  => test.fail("a length field longer than the span is truncation")
+        Err(_) => test.assert(true)
+
+@test
+fn test_sub_and_after_are_relative_and_answer_absolute_offsets() [io]
+    test.case("`sub` indexes from the span's start and answers a buffer offset")
+    match pktspan.sub(pktspan.span(14, 20), 12, 4)
+        Ok(s)  =>
+            test.assert(s.off == 26)
+            test.assert(s.len == 4)
+        Err(_) => test.fail("bytes 12 to 16 are inside a twenty-byte header")
+
+    test.case("`after` is how a payload span is cut from a header's span")
+    match pktspan.after(pktspan.span(14, 46), 20)
+        Ok(s)  =>
+            test.assert(s.off == 34)
+            test.assert(s.len == 26)
+        Err(_) => test.fail("46 bytes has 26 past its first 20")
+
+    test.case("and `after` past the end is out of range")
+    match pktspan.after(pktspan.span(14, 6), 20)
+        Ok(_)  => test.fail("six bytes has nothing past its first twenty")
+        Err(_) => test.assert(true)
+
+    test.case("`same` compares regions and not bytes")
+    test.assert(pktspan.same(pktspan.span(14, 20), pktspan.span(14, 20)))
+    test.assert(not pktspan.same(pktspan.span(14, 20), pktspan.span(14, 21)))
+
+@test
+fn test_every_multi_byte_field_here_is_big_endian() [io]
+    // RFC 791 appendix B calls it network byte order.  There is no
+    // little-endian reader in this package because reading one of
+    // these fields little-endian is never right.
+    let b = bytes.from_byte_list([0x45, 0x00, 0x00, 0x28, 0xDE, 0xAD, 0xBE, 0xEF])
+
+    test.case("a byte is a byte")
+    match pktspan.u8_at(b, pktspan.whole(b), 0)
+        Ok(v)  => test.assert(v == 0x45)
+        Err(_) => test.fail("offset 0 is inside an eight-byte buffer")
+
+    test.case("a sixteen-bit field reads high byte first")
+    match pktspan.u16_be_at(b, pktspan.whole(b), 2)
+        Ok(v)  => test.assert(v == 0x0028)
+        Err(_) => test.fail("offset 2 is inside an eight-byte buffer")
+
+    test.case("and a thirty-two-bit field answers unsigned")
+    match pktspan.u32_be_at(b, pktspan.whole(b), 4)
+        Ok(v)  => test.assert(v == 0xDEADBEEF)
+        Err(_) => test.fail("offset 4 is inside an eight-byte buffer")
+
+@test
+fn test_bytes_of_is_the_only_call_that_allocates() [io]
+    // It is the door out of the span world, and it has a plain name so
+    // that a reader looking for the allocation in a capture walk finds
+    // it.
+    test.case("it answers the span's bytes as a buffer of their own")
+    let b = bytes.from_byte_list([1, 2, 3, 4, 5, 6, 7, 8])
+    match pktspan.bytes_of(b, pktspan.span(2, 3))
+        Ok(c)  => test.assert(bytes.to_hex(c) == "030405")
+        Err(_) => test.fail("bytes 2 to 5 are inside an eight-byte buffer")
+
+    test.case("and refuses a span that does not fit, rather than truncating")
+    match pktspan.bytes_of(b, pktspan.span(6, 8))
+        Ok(_)  => test.fail("a span past the buffer has no bytes to copy")
+        Err(_) => test.assert(true)

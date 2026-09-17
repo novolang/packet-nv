@@ -1,0 +1,101 @@
+// pktudp_tests.nv — eight bytes and two rules.
+//
+// RED ON PURPOSE.  What is asserted is that the length field counts the
+// header too, and that the unchecksummed builder is named for what it
+// is.
+
+use std.test
+use std.bytes
+use ip
+use pktspan
+use pktudp
+use pktsum
+
+// A UDP datagram: ports 1234 to 53, length 12, four bytes of payload —
+// in a buffer with eighteen bytes of Ethernet padding behind it.
+fn padded() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x0C, 0x00, 0x00,
+                              0xDE, 0xAD, 0xBE, 0xEF]),
+        bytes.zeros(18)])
+
+@test
+fn test_the_length_field_includes_the_header() [io]
+    // A parser taking it as the payload length reads eight bytes too
+    // many, which in a padded frame is padding.
+    let d = padded()
+    match pktudp.parse(d, pktspan.whole(d))
+        Ok(u)  =>
+            test.case("the header is eight bytes")
+            test.assert(u.header.len == 8)
+
+            test.case("the length field says twelve")
+            match pktudp.length(d, u)
+                Ok(n)  => test.assert(n == 12)
+                Err(_) => test.fail("the fixture says 12")
+
+            test.case("and the payload is four, not twelve and not twenty-two")
+            test.assert(pktudp.payload(u).len == 4)
+            test.assert(u.payload.len == 4)
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+    test.case("a length below eight is malformed")
+    let short = bytes.set_u16_be(padded(), 4, 7)
+    match pktudp.parse(short, pktspan.whole(short))
+        Ok(_)                   => test.fail("seven is shorter than the header it measures")
+        Err(PktBadLength(f, v)) =>
+            test.assert(f == "udp_length")
+            test.assert(v == 7)
+        Err(_)                  => test.fail("wrong reason for a length below eight")
+
+@test
+fn test_the_ports_and_the_checksum_field() [io]
+    let d = padded()
+    match pktudp.parse(d, pktspan.whole(d))
+        Ok(u)  =>
+            test.case("the ports")
+            match pktudp.source_port(d, u)
+                Ok(p)  => test.assert(p == 1234)
+                Err(_) => test.fail("the fixture says 1234")
+            match pktudp.destination_port(d, u)
+                Ok(p)  => test.assert(p == 53)
+                Err(_) => test.fail("the fixture says 53")
+
+            test.case("and a zero checksum is a value here, not yet a verdict")
+            match pktudp.checksum(d, u)
+                Ok(c)  => test.assert(c == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_a_zero_checksum_over_ipv4_is_absent() [io]
+    let d = padded()
+    let p = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+                               PktProtoUdp, 12)
+
+    test.case("the verdict is `absent`, and a tool must not count it as corrupt")
+    match pktudp.parse(d, pktspan.whole(d))
+        Ok(u)  =>
+            match pktudp.verify_checksum(d, u, p)
+                Ok(PktChecksumAbsent) => test.assert(true)
+                Ok(_)                 => test.fail("a zero over IPv4 means not computed")
+                Err(_)                => test.fail("the whole datagram is present")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_unchecksummed_builder_is_named_for_what_it_is() [io]
+    // It takes no pseudo-header at all, because there is nothing for it
+    // to checksum, and its name says which IP version permits it.
+    test.case("a checksummed datagram is eight bytes plus its payload")
+    let p = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+                               PktProtoUdp, 12)
+    match pktudp.build(5353, 5353, bytes.zeros(4), p)
+        Ok(b)  => test.assert(bytes.len(b) == 12)
+        Err(_) => test.fail("four bytes of payload build a twelve-byte datagram")
+
+    test.case("and so is one without a checksum")
+    match pktudp.build_ipv4_without_checksum(5353, 5353, bytes.zeros(4))
+        Ok(b)  => test.assert(bytes.len(b) == 12)
+        Err(_) => test.fail("four bytes of payload build a twelve-byte datagram")

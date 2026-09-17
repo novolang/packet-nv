@@ -1,0 +1,490 @@
+// pktarp.nv — the Address Resolution Protocol of RFC 826, as spans.
+//
+// ARP HAS NO FIXED LAYOUT
+//
+// Every other header this package reads has fields at fixed offsets.
+// An ARP packet does not: after eight fixed bytes it carries four
+// addresses whose sizes are given by two of those bytes.  The hardware
+// address length and the protocol address length are read first, and
+// every offset after them is computed.  RFC 826 was written that way on
+// purpose — it resolves any protocol address over any hardware address
+// — and the consequence is that a parser with the Ethernet-over-IPv4
+// offsets baked in is a parser that reads the wrong bytes the first
+// time it meets anything else.
+//
+// So `sender_protocol_span` takes the buffer, because it cannot know
+// where the field is without reading two other fields first, and
+// `sender_ipv4` refuses a packet whose protocol length is not four
+// rather than reading four bytes of an address that is sixteen bytes
+// long.
+//
+// WHAT IS NOT HERE
+//
+// There is no ARP cache.  A cache is state with a lifetime, an
+// eviction rule and a conflict policy, and all three belong to the
+// program that owns the interface.  This module reads and writes the
+// packets.
+//
+// THE ANNOUNCEMENT CASE
+//
+// A packet whose sender and target protocol addresses are the same is
+// a gratuitous ARP: a host telling the segment which hardware address
+// now answers for an address.  It is how a machine announces itself
+// after booting, how a failover pair moves a service address, and how
+// an attacker takes over a gateway.  The three are the same packet, so
+// `is_gratuitous` reports the shape and says nothing about the intent.
+
+// An ARP packet, as a span over the caller's buffer.
+//
+// The fields after the first eight bytes are at offsets computed from
+// the two length bytes, so every accessor for them takes the buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  => println("${a.span.len}")
+//         Err(e) => println(e.message())
+// ```
+pub struct PktArp
+    // The whole packet, from the hardware type to the last byte of the
+    // target protocol address.  Its length is eight plus twice the
+    // hardware address length plus twice the protocol address length.
+    span: PktSpan
+
+// The operation an ARP packet requests.
+//
+// ```novo
+// use pktarp
+//
+// fn main() [io]
+//     println("${pktarp.operation_code(PktArpRequest)}")
+// ```
+pub enum PktArpOp
+    // 1.  A request: "who has this protocol address".  Sent to the
+    // broadcast hardware address, with the target hardware address
+    // field set to zeroes, because it is the thing being asked for.
+    PktArpRequest
+    // 2.  A reply: "this hardware address has it".  Sent to the
+    // requester, and a host that believes any reply it sees rather
+    // than one it asked for is a host anybody on the segment can
+    // redirect.
+    PktArpReply
+    // Any other operation, carrying the number.  3 and 4 are reverse
+    // ARP, 8 and 9 are inverse ARP; both are the same packet shape
+    // with a different question.
+    PktArpOther(code: Int)
+
+// Read an ARP packet out of a span.
+//
+// Reads the two length bytes and requires eight plus twice each of
+// them; `PktTruncated` when the span is shorter.  Checks nothing about
+// which address families are named, because RFC 826 permits any pair —
+// `sender_ipv4` is where the Ethernet-over-IPv4 assumption is made and
+// refused.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  => println("${a.span.off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(buf: Bytes, at: PktSpan) -> Result<PktArp, PktError>
+    todo("packet-nv.pktarp.parse")
+
+// The hardware type: 1 for Ethernet (RFC 826 and the IANA hardware
+// types registry).
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.hardware_type(buf, a)
+//                 Ok(t)  => println("${t}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn hardware_type(buf: Bytes, a: PktArp) -> Result<Int, PktError>
+    todo("packet-nv.pktarp.hardware_type")
+
+// The protocol type, using the ethertype numbering: 0x0800 for IPv4.
+//
+// There is no ARP for IPv6.  IPv6 resolves addresses with Neighbour
+// Discovery, which is ICMPv6 and is read by `pkticmp`, so a packet
+// here naming 0x86DD is malformed rather than interesting.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.protocol_type(buf, a)
+//                 Ok(t)  => println("${t}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn protocol_type(buf: Bytes, a: PktArp) -> Result<Int, PktError>
+    todo("packet-nv.pktarp.protocol_type")
+
+// The hardware address length in bytes: 6 for Ethernet.
+//
+// Every offset past the first eight bytes depends on this.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.hardware_length(buf, a)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn hardware_length(buf: Bytes, a: PktArp) -> Result<Int, PktError>
+    todo("packet-nv.pktarp.hardware_length")
+
+// The protocol address length in bytes: 4 for IPv4.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.protocol_length(buf, a)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn protocol_length(buf: Bytes, a: PktArp) -> Result<Int, PktError>
+    todo("packet-nv.pktarp.protocol_length")
+
+// The operation.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.operation(buf, a)
+//                 Ok(o)  => println(pktarp.operation_name(o))
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn operation(buf: Bytes, a: PktArp) -> Result<PktArpOp, PktError>
+    todo("packet-nv.pktarp.operation")
+
+// The sixteen-bit number an operation is written as.
+//
+// ```novo
+// use pktarp
+//
+// fn main() [io]
+//     println("${pktarp.operation_code(PktArpReply)}")
+// ```
+pub fn operation_code(o: PktArpOp) -> Int
+    todo("packet-nv.pktarp.operation_code")
+
+// The operation's name: `"request"`, `"reply"`, or the number.
+//
+// ```novo
+// use pktarp
+//
+// fn main() [io]
+//     println(pktarp.operation_name(PktArpOther(8)))
+// ```
+pub fn operation_name(o: PktArpOp) -> Str
+    todo("packet-nv.pktarp.operation_name")
+
+// The sender's hardware address, as a span.
+//
+// At offset 8, for `hardware_length` bytes.  In a request this is the
+// address to reply to.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.sender_hardware_span(buf, a)
+//                 Ok(s)  => println("${s.off}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sender_hardware_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.sender_hardware_span")
+
+// The sender's protocol address, as a span.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.sender_protocol_span(buf, a)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sender_protocol_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.sender_protocol_span")
+
+// The target's hardware address, as a span.
+//
+// In a request it is zeroes, because it is what is being asked for.
+// Some implementations put the broadcast address there instead, and
+// neither is a fault.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.target_hardware_span(buf, a)
+//                 Ok(s)  => println("${s.off}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn target_hardware_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.target_hardware_span")
+
+// The target's protocol address, as a span.
+//
+// In a request this is the address being resolved.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.target_protocol_span(buf, a)
+//                 Ok(s)  => println("${s.len}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn target_protocol_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.target_protocol_span")
+
+// The sender's protocol address, as a span, refusing a packet that is
+// not Ethernet over IPv4.
+//
+// `PktBadArpShape` when the protocol type is not 0x0800 or the protocol
+// address length is not 4.  Refusing is the point: a packet resolving
+// some other protocol carries an address of some other size, and
+// reading four bytes of it would produce an address that looks entirely
+// plausible and is not one.
+//
+// THE CHECKING FORM.  `sender_ipv4` is the convenience beside it and
+// cannot report this, because `Ipv4` is a `@value` struct and may be
+// neither a `Result` payload nor an option (SPEC section 14.5).
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.sender_ipv4_span(buf, a)
+//                 Ok(s)  => println("${s.off}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn sender_ipv4_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.sender_ipv4_span")
+
+// The target's protocol address, as a span, refusing a packet that is
+// not Ethernet over IPv4.
+//
+// `PktBadArpShape` under the same conditions as `sender_ipv4_span`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.target_ipv4_span(buf, a)
+//                 Ok(s)  => println("${s.off}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn target_ipv4_span(buf: Bytes, a: PktArp) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktarp.target_ipv4_span")
+
+// The sender's protocol address as an `Ipv4`.
+//
+// TOTAL, AND THAT IS NOT A CHOICE: `Ipv4` is a `@value` struct, which
+// may be neither a `Result` payload nor an option, so there is no way
+// to answer a reason here.  It answers the zero address when the packet
+// is not Ethernet over IPv4 or the span does not fit the buffer, and
+// `sender_ipv4_span` is the form that says which.  A tool that must
+// tell `0.0.0.0` in an ARP probe (RFC 5227 section 2.1.1) from a
+// refusal calls that one first.
+//
+// The answer is ipaddr-nv's own value type, so a caller comparing it
+// against a configured prefix hands it to `Net4.contains` without
+// encoding it back into bytes.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  => println(show.addr4(pktarp.sender_ipv4(buf, a)))
+//         Err(e) => println(e.message())
+// ```
+pub fn sender_ipv4(buf: Bytes, a: PktArp) -> Ipv4
+    todo("packet-nv.pktarp.sender_ipv4")
+
+// The target's protocol address as an `Ipv4`.
+//
+// Total, on the same terms as `sender_ipv4`; `target_ipv4_span` is the
+// form that reports a refusal.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+// use show
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  => println(show.addr4(pktarp.target_ipv4(buf, a)))
+//         Err(e) => println(e.message())
+// ```
+pub fn target_ipv4(buf: Bytes, a: PktArp) -> Ipv4
+    todo("packet-nv.pktarp.target_ipv4")
+
+// Whether the sender and target protocol addresses are the same.
+//
+// A gratuitous ARP.  A host announcing itself after booting, a
+// failover pair moving a service address, and an attacker claiming the
+// gateway all send exactly this packet, so what is reported is the
+// shape and never the intent.  A tool that wants to find the third
+// case watches for the same protocol address announced from more than
+// one hardware address, which is state and belongs to the tool.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.is_gratuitous(buf, a)
+//                 Ok(g)  => println("${g}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn is_gratuitous(buf: Bytes, a: PktArp) -> Result<Bool, PktError>
+    todo("packet-nv.pktarp.is_gratuitous")
+
+// Whether the packet is a probe: a request whose sender protocol
+// address is all zeroes.
+//
+// RFC 5227 section 2.1.1's address conflict detection.  A host about
+// to claim an address asks for it with a zero sender address, so that
+// the probe itself does not populate anyone's cache with a mapping
+// that may be withdrawn a moment later.  A tool that treated a probe
+// as an announcement would record the claim before it was made.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktarp
+//
+// fn main() [io]
+//     let buf = bytes.zeros(28)
+//     match pktarp.parse(buf, pktspan.whole(buf))
+//         Ok(a)  =>
+//             match pktarp.is_probe(buf, a)
+//                 Ok(p)  => println("${p}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn is_probe(buf: Bytes, a: PktArp) -> Result<Bool, PktError>
+    todo("packet-nv.pktarp.is_probe")
+
+// Build an Ethernet-over-IPv4 ARP packet: twenty-eight bytes.
+//
+// Hardware type 1, protocol type 0x0800, lengths 6 and 4 — the only
+// combination anybody sends, and the one this package's `sender_ipv4`
+// will read back.  `PktBadLength` when either hardware address is not
+// six bytes.
+//
+// For a request, pass six zero bytes as the target hardware address:
+// it is the field being asked about.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktarp
+//
+// fn main() [io]
+//     let mine = bytes.from_byte_list([2, 0, 0, 0, 0, 1])
+//     match pktarp.build(PktArpRequest, mine, ip.ipv4(10, 0, 0, 1),
+//                        bytes.zeros(6), ip.ipv4(10, 0, 0, 2))
+//         Ok(p)  => println("${bytes.len(p)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(op: PktArpOp, sender_hardware: Bytes, sender_ip: Ipv4, target_hardware: Bytes,
+             target_ip: Ipv4) -> Result<Bytes, PktError>
+    todo("packet-nv.pktarp.build")

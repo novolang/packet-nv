@@ -1,0 +1,462 @@
+// pktsum.nv — the internet checksum, the pseudo-headers it is taken
+// over, and a verdict with four cases rather than a boolean.
+//
+// THE ARITHMETIC
+//
+// RFC 1071 defines one checksum and every protocol here uses it: the
+// sixteen-bit one's-complement of the one's-complement sum of the
+// bytes, taken two at a time, big-endian, with a zero byte appended if
+// the length is odd.  The carries fold back in, which is what makes
+// the sum independent of the order the words are added in and of where
+// the odd byte falls.
+//
+// The field being checked is included in the sum as zero when it is
+// computed, so a receiver can sum the whole header INCLUDING the
+// checksum field and expect 0xFFFF.  Both forms are here:
+// `checksum_of` computes the value to write, and comparing it with the
+// carried one is what `compare` does.
+//
+// THE PSEUDO-HEADER, AND WHY IT IS BYTES
+//
+// TCP, UDP and ICMPv6 do not checksum only their own bytes.  RFC 9293
+// section 3.1 and RFC 768 prepend a twelve-byte pseudo-header — source
+// address, destination address, a zero, the protocol, and the
+// upper-layer length — and RFC 8200 section 8.1 prepends a forty-byte
+// one for IPv6.  It is not transmitted; it exists so that a datagram
+// delivered to the wrong host or the wrong protocol fails its
+// checksum.
+//
+// `PktPseudo` holds those bytes rather than the addresses, and that is
+// deliberate.  A struct with two `Ipv4` fields and a struct with two
+// `Ipv6` fields would be two types, and every TCP and UDP function
+// that verifies a checksum would need two spellings.  The
+// specification defines the pseudo-header as a byte layout, the sum
+// consumes bytes, and one type with two constructors keeps the version
+// difference where it belongs — at the point where the caller knows
+// which IP header it came from.  Holding the addresses instead would
+// also make the struct `@value`, because they are, and a `@value`
+// struct cannot come back from a `Result` (`E2015`).
+//
+// THE IPv6 LENGTH IS NOT THE PAYLOAD LENGTH
+//
+// The pseudo-header's length field is the UPPER-LAYER packet length.
+// For IPv4 that is the total length minus the header length.  For IPv6
+// it is the payload length minus every extension header in the chain,
+// and a datagram with a routing header and a destination-options
+// header has two subtractions to make.  A verifier that used the
+// payload length directly reports a wrong checksum on every IPv6
+// datagram with an extension header, which is the commonest false
+// alarm in IPv6 analysis.  `pktipv6.pseudo` does the subtraction from
+// the walked chain.
+//
+// FOUR ANSWERS, NOT TWO
+//
+// `PktChecksum` has four cases because a boolean has to lie about two
+// of them.  A UDP datagram over IPv4 with a zero checksum has NOT
+// failed its checksum; RFC 768 says a zero means the sender did not
+// compute one, and reporting that as corruption is wrong.  A packet
+// whose covered bytes were cut off by the capture's snapshot length
+// cannot be checked at all, and neither can an outgoing packet
+// captured before the network card filled its checksum in — which is
+// what a local capture of an offloaded send looks like, and why
+// tcpdump on a sender's own machine shows a wall of bad checksums that
+// are not bad.
+
+// The verdict on a checksum.
+//
+// Four cases, because "valid" and "wrong" cannot describe a checksum
+// nobody computed and cannot describe one the reader has not got the
+// bytes to check.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_reason(PktChecksumAbsent))
+// ```
+pub enum PktChecksum
+    // The computed value matches the one the packet carries.
+    PktChecksumValid
+    // The computed value does not match.  `want` is what the bytes
+    // say it should be and `got` is what the packet carried, so a log
+    // line can print both.
+    PktChecksumWrong(want: Int, got: Int)
+    // The packet carries a zero checksum where zero means "not
+    // computed".  RFC 768 allows it for UDP over IPv4 and only there:
+    // a zero TCP checksum is a wrong checksum, and RFC 8200 section
+    // 8.1 requires a UDP checksum over IPv6, with the tunnelling
+    // exception of RFC 6935 the only way one is legally absent.
+    // This is NOT valid and NOT wrong, and `is_valid` answers false.
+    PktChecksumAbsent
+    // The bytes the checksum covers are not all available, so no
+    // verdict is possible.  `why` says which: the capture's snapshot
+    // length cut the packet short, or the packet was taken from the
+    // sending host before the network card computed the checksum.
+    // Reporting this as wrong is how a capture taken on a sender's own
+    // machine appears to be full of corruption.
+    PktChecksumUnverifiable(why: Str)
+
+// The twelve or forty bytes a transport checksum is taken over before
+// the transport header itself.
+//
+// Never transmitted.  It exists so that a datagram delivered to the
+// wrong address or the wrong protocol fails its checksum, which is the
+// only end-to-end check either of those gets.
+//
+// IT HOLDS THE BYTES AND NOT THE ADDRESSES, for two reasons.  A struct
+// with two `Ipv4` fields and a struct with two `Ipv6` fields would be
+// two types, and every function here that verifies a checksum would
+// need two spellings of itself.  And ipaddr-nv's addresses are `@value`
+// structs, so a struct holding them is `@value` too (`E2015`) and could
+// not come back from a `Result` — which `pktipv4.pseudo` and
+// `pktipv6.pseudo` both do, because computing the upper-layer length
+// can fail.  The specification defines the pseudo-header as a byte
+// layout and the sum consumes bytes, so holding the bytes is also the
+// closer reading.
+//
+// ```novo
+// use ip
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4(10, 0, 0, 1), ip.ipv4(10, 0, 0, 2),
+//                                PktProtoUdp, 12)
+//     println("${pktsum.pseudo_length(p)}")
+// ```
+pub struct PktPseudo
+    // The pseudo-header exactly as it is summed: twelve bytes for the
+    // IPv4 form of RFC 9293 section 3.1, forty for the IPv6 form of
+    // RFC 8200 section 8.1.
+    header: Bytes
+    // The upper-layer packet length the pseudo-header carries: the
+    // transport header plus its payload, and nothing of the IP header.
+    length: Int
+    // The protocol number the pseudo-header carries — 6, 17 or 58.
+    protocol: Int
+    // Whether this is the forty-byte IPv6 form.
+    over_ipv6: Bool
+
+// The twelve-byte IPv4 pseudo-header (RFC 9293 section 3.1).
+//
+// `length` is the upper-layer packet length: the TCP or UDP header
+// plus its payload, which for a parsed datagram is the IP total length
+// minus the IP header length.  It is NOT the IP total length, and
+// using that is a checksum that is wrong by exactly the header length.
+//
+// ```novo
+// use ip
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4(192, 0, 2, 1), ip.ipv4(192, 0, 2, 2),
+//                                PktProtoTcp, 40)
+//     println("${p.length}")
+// ```
+pub fn pseudo_ipv4(source: Ipv4, destination: Ipv4, protocol: PktProtocol, length: Int) -> PktPseudo
+    todo("packet-nv.pktsum.pseudo_ipv4")
+
+// The forty-byte IPv6 pseudo-header (RFC 8200 section 8.1).
+//
+// `next_header` is the UPPER-LAYER protocol — 6, 17 or 58 — and not
+// the next-header value out of the IPv6 header, which for a datagram
+// with an extension chain names the first extension header instead.
+// A verifier that copied the IPv6 header's own field computes the sum
+// over 0 or 44 and reports every such datagram as corrupt.
+//
+// `length` is the upper-layer packet length: the payload length less
+// every extension header. `pktipv6.pseudo` computes both from a walked
+// chain.
+//
+// ```novo
+// use ip
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv6(ip.ipv6_zero(), ip.ipv6_zero(), PktProtoIcmpv6, 8)
+//     println("${p.over_ipv6}")
+// ```
+pub fn pseudo_ipv6(source: Ipv6, destination: Ipv6, next_header: PktProtocol,
+                   length: Int) -> PktPseudo
+    todo("packet-nv.pktsum.pseudo_ipv6")
+
+// The pseudo-header as the bytes the sum runs over: twelve for IPv4,
+// forty for IPv6.
+//
+// For a caller checksumming with something else — a hardware offload
+// path, a test comparing against a reference implementation — and for
+// showing what was summed when a verdict is disputed.  It allocates.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4_zero(), ip.ipv4_zero(), PktProtoUdp, 8)
+//     println(bytes.to_hex(pktsum.pseudo_bytes(p)))
+// ```
+pub fn pseudo_bytes(p: PktPseudo) -> Bytes
+    todo("packet-nv.pktsum.pseudo_bytes")
+
+// The upper-layer packet length the pseudo-header carries.
+//
+// ```novo
+// use ip
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     println("${pktsum.pseudo_length(pktsum.pseudo_ipv4(ip.ipv4_zero(), ip.ipv4_zero(), PktProtoTcp, 20))}")
+// ```
+pub fn pseudo_length(p: PktPseudo) -> Int
+    todo("packet-nv.pktsum.pseudo_length")
+
+// The one's-complement sum of a span, before folding and before
+// complementing.
+//
+// The raw accumulator of RFC 1071 section 1.  Exposed because a caller
+// summing several regions — a pseudo-header, a header, a payload held
+// in a different buffer — adds the partial sums and folds once at the
+// end, and folding each part separately would be wasted work.  An odd
+// length is padded with one zero byte, as the RFC requires.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktsum
+//
+// fn main() [io]
+//     match pktsum.ones_complement_sum(bytes.zeros(20), pktspan.span(0, 20))
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn ones_complement_sum(buf: Bytes, s: PktSpan) -> Result<Int, PktError>
+    todo("packet-nv.pktsum.ones_complement_sum")
+
+// Fold a raw sum's carries back in and complement it, giving the
+// sixteen-bit value that goes in the field.
+//
+// The second half of RFC 1071 section 1: add the high sixteen bits to
+// the low sixteen until nothing is left above bit fifteen, then
+// complement.  A caller that summed several regions with
+// `ones_complement_sum` calls this once.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println("${pktsum.ones_complement_fold(0x1FFFF)}")
+// ```
+pub fn ones_complement_fold(sum: Int) -> Int
+    todo("packet-nv.pktsum.ones_complement_fold")
+
+// The checksum of a span, with no pseudo-header.
+//
+// What the IPv4 header checksum (RFC 791 section 3.1) and the ICMP for
+// IPv4 checksum (RFC 792) are: the sum over the bytes themselves and
+// nothing else.  The caller zeroes the checksum field first, or
+// subtracts it, because the field is part of what is summed.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+// use pktsum
+//
+// fn main() [io]
+//     match pktsum.checksum_of(bytes.zeros(20), pktspan.span(0, 20))
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn checksum_of(buf: Bytes, s: PktSpan) -> Result<Int, PktError>
+    todo("packet-nv.pktsum.checksum_of")
+
+// The checksum of a span with a pseudo-header prepended.
+//
+// What the TCP checksum, the UDP checksum and the ICMPv6 checksum are.
+// The span is the transport header and its payload; the pseudo-header
+// is summed first and is not part of the span.
+//
+// ```novo
+// use std.bytes
+// use ip
+// use pktspan
+// use pktsum
+// use pktproto
+//
+// fn main() [io]
+//     let p = pktsum.pseudo_ipv4(ip.ipv4_zero(), ip.ipv4_zero(), PktProtoUdp, 8)
+//     match pktsum.checksum_with_pseudo(bytes.zeros(64), pktspan.span(34, 8), p)
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn checksum_with_pseudo(buf: Bytes, s: PktSpan, p: PktPseudo) -> Result<Int, PktError>
+    todo("packet-nv.pktsum.checksum_with_pseudo")
+
+// The verdict for a protocol where a zero checksum means zero.
+//
+// `PktChecksumValid` when the two agree and `PktChecksumWrong`
+// otherwise, with no third case: for IPv4 headers, for ICMP, for
+// ICMPv6 and for TCP, a carried zero is a value like any other and
+// almost certainly a wrong one.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_reason(pktsum.compare(0x1234, 0x1234)))
+//     println(pktsum.checksum_reason(pktsum.compare(0x1234, 0x0000)))
+// ```
+pub fn compare(computed: Int, carried: Int) -> PktChecksum
+    todo("packet-nv.pktsum.compare")
+
+// The verdict for UDP over IPv4, where a carried zero means the sender
+// did not compute one.
+//
+// `PktChecksumAbsent` when `carried` is zero, and otherwise what
+// `compare` answers.  RFC 768 makes the UDP checksum optional over
+// IPv4, and a great deal of real traffic — some DNS, most tunnelling
+// protocols, a lot of embedded telemetry — sends zero.  A tool using
+// `compare` here counts all of it as corrupt.
+//
+// There is deliberately no UDP-over-IPv6 version: RFC 8200 section 8.1
+// requires the checksum there, so a zero is wrong, and `compare` is
+// the right function.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_reason(pktsum.compare_udp_ipv4(0x1234, 0x0000)))
+// ```
+pub fn compare_udp_ipv4(computed: Int, carried: Int) -> PktChecksum
+    todo("packet-nv.pktsum.compare_udp_ipv4")
+
+// The verdict when the covered bytes are not all present.
+//
+// `why` is the reason, for a status column: the capture's snapshot
+// length, or a checksum the sending host's network card had not filled
+// in yet.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_reason(pktsum.unverifiable("snapshot length")))
+// ```
+pub fn unverifiable(why: Str) -> PktChecksum
+    todo("packet-nv.pktsum.unverifiable")
+
+// Whether the verdict is `PktChecksumValid`.
+//
+// FALSE for `PktChecksumAbsent` and for `PktChecksumUnverifiable`, and
+// that is the point: `not is_valid(c)` does NOT mean the packet is
+// corrupt.  A tool counting bad checksums matches
+// `PktChecksumWrong` and nothing else; a tool deciding whether to
+// trust a payload treats absent and unverifiable as "unknown", which
+// is what they are.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println("${pktsum.is_valid(PktChecksumValid)}")
+//     println("${pktsum.is_valid(PktChecksumAbsent)}")
+// ```
+pub fn is_valid(c: PktChecksum) -> Bool
+    todo("packet-nv.pktsum.is_valid")
+
+// A one-line description of the verdict, for a display.
+//
+// `"ok"`, `"wrong: computed 0x1234, carried 0x0000"`, `"not computed
+// by the sender"`, `"unverifiable: snapshot length"`.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_reason(PktChecksumWrong(0x1234, 0)))
+// ```
+pub fn checksum_reason(c: PktChecksum) -> Str
+    todo("packet-nv.pktsum.checksum_reason")
+
+// A short stable code for a counter: `"valid"`, `"wrong"`,
+// `"absent"`, `"unverifiable"`.
+//
+// Carries nothing the packet chose, so it is safe as a metric label.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println(pktsum.checksum_code(PktChecksumUnverifiable("offload")))
+// ```
+pub fn checksum_code(c: PktChecksum) -> Str
+    todo("packet-nv.pktsum.checksum_code")
+
+// The value a UDP sender writes when the computed checksum is zero.
+//
+// 0xFFFF, because zero in the field means "no checksum" and a sender
+// that wrote the computed zero would be telling the receiver not to
+// check.  The two are equal in one's-complement arithmetic, so writing
+// 0xFFFF changes nothing about the check and everything about what the
+// field means.  RFC 768 states it in the UDP description, and it
+// applies to UDP alone: a TCP checksum that computes to zero is
+// written as zero.
+//
+// Answers its argument unchanged for every other value.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println("${pktsum.udp_transmit_value(0)}")
+//     println("${pktsum.udp_transmit_value(0x1234)}")
+// ```
+pub fn udp_transmit_value(computed: Int) -> Int
+    todo("packet-nv.pktsum.udp_transmit_value")
+
+// Whether a carried zero means "not computed" for this protocol.
+//
+// True only for UDP over IPv4.  The rule as a function, so a generic
+// verifier that has a `PktProtocol` and a version can choose between
+// `compare` and `compare_udp_ipv4` without writing the condition out
+// again in every tool.
+//
+// ```novo
+// use pktproto
+// use pktsum
+//
+// fn main() [io]
+//     println("${pktsum.zero_means_absent(PktProtoUdp, false)}")
+//     println("${pktsum.zero_means_absent(PktProtoUdp, true)}")
+// ```
+pub fn zero_means_absent(p: PktProtocol, over_ipv6: Bool) -> Bool
+    todo("packet-nv.pktsum.zero_means_absent")
+
+// A checksum updated for a field that changed, without re-summing the
+// packet.
+//
+// RFC 1624 section 3's equation.  A router decrementing a TTL, a
+// network address translator rewriting an address and a port, a test
+// harness mutating one field: each changes a couple of bytes, and
+// re-summing a nine-thousand-byte datagram to reflect two of them is
+// the difference between a router that forwards at line rate and one
+// that does not.
+//
+// `old` and `new` are the sixteen-bit words that changed.  The earlier
+// equation in RFC 1141 is subtly wrong — it can produce 0x0000 where
+// 0xFFFF is meant, which in UDP means "no checksum" — and RFC 1624
+// exists to correct it. This function is the corrected form.
+//
+// ```novo
+// use pktsum
+//
+// fn main() [io]
+//     println("${pktsum.incremental_update(0xB861, 0x4000, 0x0000)}")
+// ```
+pub fn incremental_update(checksum: Int, old: Int, new: Int) -> Int
+    todo("packet-nv.pktsum.incremental_update")

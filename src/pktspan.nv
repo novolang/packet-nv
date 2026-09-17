@@ -1,0 +1,315 @@
+// pktspan.nv — the load-bearing decision of this package: a header is
+// a SPAN over the caller's bytes, not a struct of copied fields.
+//
+// WHAT A SPAN IS
+//
+// `PktSpan` is an offset and a length into a `Bytes` the caller owns.
+// A parse walks the buffer, checks the lengths, and hands back offsets:
+// `pktipv4.parse` answers a `PktIpv4` holding three spans — the fixed
+// header, the option area, and the payload — and no field of the
+// packet has been copied anywhere.  Reading a field is
+// `pktipv4.ttl(buf, header)`, which reads one byte at a known offset.
+//
+// WHY, IN NUMBERS
+//
+// A capture file holds millions of packets and the ordinary question
+// asked of one is "which flow is this and how big is it".  A parser
+// that answered a struct would allocate one per packet per layer:
+// Ethernet, IPv4, TCP is three allocations and about ninety bytes
+// copied, for a question answered by six field reads.  Over ten
+// million packets that is thirty million allocations the program did
+// not need.  Under this shape the only heap traffic in a capture walk
+// is the buffer the caller already had.
+//
+// It also keeps a rewriting tool honest.  A tool that decrements a TTL
+// and recomputes the checksum edits the caller's buffer at the offset
+// the span names, and there is no second copy to forget to write back.
+//
+// WHAT IT COSTS, AND THE CALLER PAYS IT
+//
+// A span does not know which buffer it came from.  Nothing in a
+// `PktSpan` refers to a `Bytes`, so nothing stops a caller reading a
+// span cut from packet 7 against the buffer holding packet 8: the
+// offsets are in range, the read succeeds, and the answer is wrong.
+// `fits` is the check and `PktSpanOutOfRange` is the reason when the
+// offsets are not even in range, but a span used with the wrong buffer
+// of the same size cannot be detected at all.  The rule for a caller
+// is one sentence: a span is only meaningful with the buffer it was
+// cut from, and it is only valid while that buffer is unmodified.
+//
+// WHY `PktSpan` IS A BOXED STRUCT
+//
+// Two `Int`s would sit on the stack happily as a `@value` struct.  It
+// is not one, because a `@value` struct may not be a `Result` payload
+// (`E2015`), and every parse in this package answers
+// `Result<_, PktError>` over a type that holds spans.  A `@value`
+// `PktSpan` would make `PktIpv4` `@value` too, and `PktIpv4` would
+// then be unable to come back from `parse`.  The pseudo-header in
+// `pktsum` is the one `@value` type here, and it is one because it
+// holds ipaddr-nv's addresses, which are `@value` themselves.
+//
+// THE ONE PLACE BYTES ARE COPIED
+//
+// `bytes_of` allocates.  It is the door out of the span world, for a
+// caller that wants a payload as a `Bytes` to hand to a JSON decoder
+// or a decompressor, and it has a plain name so that a reader looking
+// for the allocation in a hot loop finds it.  Every other function in
+// this package reads in place.
+
+// An offset and a length into a buffer the caller owns.
+//
+// A span is only meaningful with the buffer it was cut from.  It holds
+// no reference to that buffer, does not keep it alive, and does not
+// notice if it is modified or replaced.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     let s = pktspan.span(14, 20)
+//     println("${s.off} ${s.len}")
+// ```
+pub struct PktSpan
+    // The first byte of the span, counted from the start of the
+    // buffer and not from the start of any enclosing span.  Every
+    // offset in this package is absolute, so a span can be read
+    // without knowing what it was cut out of.
+    off: Int
+    // How many bytes the span covers.  Zero is a legal span: a TCP
+    // segment carrying only an acknowledgement has an empty payload,
+    // and that is different from having no payload span at all.
+    len: Int
+
+// A span from an offset and a length.
+//
+// Checks nothing against a buffer, because it is given none.  `fits`
+// is what answers whether a span can be read, and every reader in this
+// package checks it before reading.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.span(0, 14).len}")
+// ```
+pub fn span(off: Int, len: Int) -> PktSpan
+    todo("packet-nv.pktspan.span")
+
+// The span covering a whole buffer.
+//
+// Where a walk starts: `pktether.parse(buf, pktspan.whole(buf))` reads
+// the frame at the front of the buffer.  A caller holding several
+// packets in one buffer starts from a narrower span instead.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.whole(bytes.zeros(64)).len}")
+// ```
+pub fn whole(buf: Bytes) -> PktSpan
+    todo("packet-nv.pktspan.whole")
+
+// One past the last byte of the span — `off + len`.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.end(pktspan.span(14, 20))}")
+// ```
+pub fn end(s: PktSpan) -> Int
+    todo("packet-nv.pktspan.end")
+
+// Whether the span lies inside the buffer.
+//
+// False when the offset is negative, when the length is negative, or
+// when the end is past the buffer.  A caller that has just read a span
+// out of a capture record and is about to read it against a different
+// buffer can ask this first; every reader here asks it anyway and
+// answers `PktSpanOutOfRange`.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.fits(bytes.zeros(40), pktspan.span(20, 20))}")
+//     println("${pktspan.fits(bytes.zeros(40), pktspan.span(20, 40))}")
+// ```
+pub fn fits(buf: Bytes, s: PktSpan) -> Bool
+    todo("packet-nv.pktspan.fits")
+
+// Whether the span covers no bytes.
+//
+// An empty span is ordinary: the payload of a bare acknowledgement,
+// the option area of an IPv4 header with an IHL of 5, the extension
+// chain of an IPv6 datagram that has none.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.is_empty(pktspan.span(34, 0))}")
+// ```
+pub fn is_empty(s: PktSpan) -> Bool
+    todo("packet-nv.pktspan.is_empty")
+
+// A span inside another one, at `off` bytes from its start.
+//
+// `off` is RELATIVE to `s`, and the answer's offset is absolute, which
+// is what makes a header's fields addressable without every caller
+// carrying the enclosing offset around.  `PktSpanOutOfRange` when the
+// requested range does not fit inside `s`.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.sub(pktspan.span(14, 20), 12, 4)
+//         Ok(s)  => println("${s.off}")
+//         Err(e) => println(e.message())
+// ```
+pub fn sub(s: PktSpan, off: Int, len: Int) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktspan.sub")
+
+// Everything in `s` past its first `n` bytes.
+//
+// What a payload span is made of: a header of `n` bytes is parsed and
+// the rest of the span is what it carries.  `PktSpanOutOfRange` when
+// `s` is shorter than `n`, which is the truncation case seen from the
+// span side.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.after(pktspan.span(14, 60), 20)
+//         Ok(s)  => println("${s.off} ${s.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn after(s: PktSpan, n: Int) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktspan.after")
+
+// `s` shortened to `len` bytes.
+//
+// THE PADDING RULE, and it is the one that silently corrupts a
+// payload.  An Ethernet frame is padded with zeroes to sixty bytes
+// (IEEE 802.3 section 4.2.3.3), so a UDP datagram carrying four bytes
+// arrives in a frame with eighteen bytes of padding behind it.  A
+// parser that took the payload to the end of the buffer would hand
+// twenty-two bytes to the application.  The IP total length field, not
+// the buffer, is what says where the datagram ends, and this is the
+// function that applies it.
+//
+// `PktSpanOutOfRange` when `len` is longer than `s`, which means the
+// length field claims more than is present — truncation, reported by
+// the layer that asked.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.narrowed(pktspan.span(34, 26), 8)
+//         Ok(s)  => println("${s.len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn narrowed(s: PktSpan, len: Int) -> Result<PktSpan, PktError>
+    todo("packet-nv.pktspan.narrowed")
+
+// The byte at `off` bytes into the span.
+//
+// `off` is relative to the span.  `PktSpanOutOfRange` when the span
+// does not fit the buffer or the offset is past the span's end — never
+// a read of the buffer beyond the span, which is what stops one
+// header's parser from reading the next header's bytes.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.u8_at(bytes.zeros(64), pktspan.span(14, 20), 8)
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn u8_at(buf: Bytes, s: PktSpan, off: Int) -> Result<Int, PktError>
+    todo("packet-nv.pktspan.u8_at")
+
+// The big-endian sixteen-bit value at `off` bytes into the span.
+//
+// Every multi-byte field in every protocol this package reads is
+// big-endian: RFC 791 appendix B calls it network byte order and
+// every later specification refers back to it.  There is no
+// little-endian reader here, because reading one of these fields
+// little-endian is never right.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.u16_be_at(bytes.zeros(64), pktspan.span(0, 14), 12)
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn u16_be_at(buf: Bytes, s: PktSpan, off: Int) -> Result<Int, PktError>
+    todo("packet-nv.pktspan.u16_be_at")
+
+// The big-endian thirty-two-bit value at `off` bytes into the span.
+//
+// A TCP sequence number, an IPv4 address as an integer, an ICMP rest
+// field.  Answers an unsigned value, so a sequence number above two
+// thousand million is a positive `Int` rather than a negative one.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.u32_be_at(bytes.zeros(64), pktspan.span(14, 20), 12)
+//         Ok(v)  => println("${v}")
+//         Err(e) => println(e.message())
+// ```
+pub fn u32_be_at(buf: Bytes, s: PktSpan, off: Int) -> Result<Int, PktError>
+    todo("packet-nv.pktspan.u32_be_at")
+
+// THE ONE FUNCTION IN THIS PACKAGE THAT COPIES.  The span's bytes as a
+// new `Bytes`.
+//
+// Everything else reads in place.  This is the door out, for a caller
+// that needs a payload as a buffer of its own: a DNS message to hand
+// to a decoder, a TCP payload to append to a stream, a MAC address to
+// put in a map key.  It allocates and copies `s.len` bytes, so calling
+// it per packet in a capture walk is what turns a span-based parser
+// back into a copying one.
+//
+// `PktSpanOutOfRange` when the span does not fit the buffer.
+//
+// ```novo
+// use std.bytes
+// use pktspan
+//
+// fn main() [io]
+//     match pktspan.bytes_of(bytes.zeros(64), pktspan.span(0, 6))
+//         Ok(b)  => println(bytes.to_hex(b))
+//         Err(e) => println(e.message())
+// ```
+pub fn bytes_of(buf: Bytes, s: PktSpan) -> Result<Bytes, PktError>
+    todo("packet-nv.pktspan.bytes_of")
+
+// Whether two spans cover the same bytes of the same buffer.
+//
+// Compares the offsets and the lengths, not the bytes.  It answers
+// "is this the same region", which is what a tool checking that a
+// payload span it computed matches the one a parse handed back needs.
+//
+// ```novo
+// use pktspan
+//
+// fn main() [io]
+//     println("${pktspan.same(pktspan.span(14, 20), pktspan.span(14, 20))}")
+// ```
+pub fn same(a: PktSpan, b: PktSpan) -> Bool
+    todo("packet-nv.pktspan.same")

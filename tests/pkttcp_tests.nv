@@ -1,0 +1,235 @@
+// pkttcp_tests.nv — what a sequence number advances by, what a window
+// means, and how an option walk is made to terminate.
+//
+// RED ON PURPOSE.  The fixture is a SYN with the four options a modern
+// stack sends: maximum segment size, SACK-permitted, timestamps and
+// window scale, with the no-operation bytes that align them.
+
+use std.test
+use std.bytes
+use pktspan
+use pkttcp
+
+// A SYN: ports 1234 to 80, sequence 1000, no acknowledgement, data
+// offset 10 (forty bytes), flags SYN, window 65535, and twenty bytes of
+// options — MSS 1460, SACK-permitted, timestamps, NOP, window scale 7.
+fn syn() -> Bytes
+    bytes.from_byte_list(
+        [0x04, 0xD2, 0x00, 0x50, 0x00, 0x00, 0x03, 0xE8,
+         0x00, 0x00, 0x00, 0x00, 0xA0, 0x02, 0xFF, 0xFF,
+         0x00, 0x00, 0x00, 0x00,
+         0x02, 0x04, 0x05, 0xB4,
+         0x04, 0x02,
+         0x08, 0x0A, 0x00, 0x00, 0x30, 0x39, 0x00, 0x00, 0x00, 0x00,
+         0x01,
+         0x03, 0x03, 0x07])
+
+// A bare acknowledgement: data offset 5, flags ACK, no payload.
+fn ack() -> Bytes
+    bytes.from_byte_list(
+        [0x00, 0x50, 0x04, 0xD2, 0x00, 0x00, 0x00, 0x01,
+         0x00, 0x00, 0x03, 0xE9, 0x50, 0x10, 0x01, 0xF5,
+         0x00, 0x00, 0x00, 0x00])
+
+@test
+fn test_a_syn_advances_the_sequence_space_by_one_with_no_payload() [io]
+    // A tool using the payload length has every connection one byte
+    // out from the handshake onwards, and reports the first data
+    // segment as a retransmission.
+    let s = syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            test.case("the payload is empty")
+            test.assert(pkttcp.payload(t).len == 0)
+
+            test.case("and the segment still advances the sequence space by one")
+            match pkttcp.segment_length(s, t)
+                Ok(n)  => test.assert(n == 1)
+                Err(_) => test.fail("a SYN occupies one byte of sequence space")
+
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+    test.case("a bare acknowledgement advances it by nothing")
+    let a = ack()
+    match pkttcp.parse(a, pktspan.whole(a))
+        Ok(t)  =>
+            match pkttcp.segment_length(a, t)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("an empty ACK occupies no sequence space")
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+@test
+fn test_the_header_fields_are_read_in_the_units_a_caller_wants() [io]
+    let s = syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            test.case("the ports")
+            match pkttcp.source_port(s, t)
+                Ok(p)  => test.assert(p == 1234)
+                Err(_) => test.fail("the fixture says 1234")
+            match pkttcp.destination_port(s, t)
+                Ok(p)  => test.assert(p == 80)
+                Err(_) => test.fail("the fixture says 80")
+
+            test.case("the sequence number")
+            match pkttcp.sequence(s, t)
+                Ok(n)  => test.assert(n == 1000)
+                Err(_) => test.fail("the fixture says 1000")
+
+            test.case("the acknowledgement field, which a SYN leaves meaningless")
+            match pkttcp.acknowledgement(s, t)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+
+            test.case("the data offset in BYTES and not in words")
+            match pkttcp.data_offset(s, t)
+                Ok(n)  => test.assert(n == 40)
+                Err(_) => test.fail("a data offset of 10 is forty bytes")
+
+            test.case("and the header, options and payload spans agree with it")
+            test.assert(t.header.len == 40)
+            test.assert(t.options.len == 20)
+
+            test.case("the checksum and the urgent pointer are values, not verdicts")
+            match pkttcp.checksum(s, t)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+            match pkttcp.urgent_pointer(s, t)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("the fixture zeroes it")
+
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+@test
+fn test_the_flags_are_one_number_and_a_predicate() [io]
+    let s = syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            test.case("a SYN has the SYN bit and no other")
+            match pkttcp.flags(s, t)
+                Ok(f)  =>
+                    test.assert(pkttcp.has(f, PktTcpSyn))
+                    test.assert(not pkttcp.has(f, PktTcpAck))
+                    test.assert(not pkttcp.has(f, PktTcpFin))
+                    test.assert(not pkttcp.has(f, PktTcpRst))
+                    test.assert(not pkttcp.has(f, PktTcpPsh))
+                    test.assert(not pkttcp.has(f, PktTcpUrg))
+                    test.assert(not pkttcp.has(f, PktTcpEce))
+                    test.assert(not pkttcp.has(f, PktTcpCwr))
+                Err(_) => test.fail("the fixture carries flags")
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+    test.case("and the names print in the order tcpdump prints them")
+    test.assert(pkttcp.flag_names(0x12) == "SYN,ACK")
+    test.assert(pkttcp.flag_names(0x00) == "")
+
+@test
+fn test_the_window_is_unscaled_here_and_the_shift_is_the_peers() [io]
+    // Scaling a SYN's own window reports one a hundred and
+    // twenty-eight times too large; not scaling afterwards makes every
+    // fast connection look throttled.
+    let s = syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            test.case("the field is answered raw")
+            match pkttcp.window(s, t)
+                Ok(w)  => test.assert(w == 65535)
+                Err(_) => test.fail("the fixture says 65535")
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+    test.case("and scaling is a pure function the caller applies when it may")
+    test.assert(pkttcp.scaled_window(501, 7) == 64128)
+    test.assert(pkttcp.scaled_window(501, 0) == 501)
+
+@test
+fn test_the_option_walk_and_the_four_options_a_modern_syn_carries() [io]
+    let s = syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            match pkttcp.options(s, t)
+                Ok(os) =>
+                    test.case("five options: MSS, SACK-permitted, timestamps, NOP, window scale")
+                    test.assert(list.len(os) == 5)
+
+                    test.case("the first is the maximum segment size, and it is the PAYLOAD size")
+                    match list.first(os)
+                        Some(o) =>
+                            match pkttcp.tcp_option_kind(s, o)
+                                Ok(k)  => test.assert(k == 2)
+                                Err(_) => test.fail("the first option is kind 2")
+                            match pkttcp.tcp_option_length(s, o)
+                                Ok(n)  => test.assert(n == 4)
+                                Err(_) => test.fail("an MSS option is four bytes")
+                            match pkttcp.maximum_segment_size(s, o)
+                                Ok(m)  => test.assert(m == 1460)
+                                Err(_) => test.fail("1460 is 1500 less an IPv4 and a TCP header")
+                            match pkttcp.tcp_option_data_span(s, o)
+                                Ok(d)  => test.assert(d.len == 2)
+                                Err(_) => test.fail("an MSS option carries two bytes of data")
+                        None    => test.fail("the fixture carries options")
+
+                Err(_) => test.fail("the fixture's options walk")
+
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+    test.case("the names and the known set")
+    test.assert(pkttcp.tcp_option_name(8) == "timestamps")
+    test.assert(pkttcp.is_known_option(8))
+    test.assert(not pkttcp.is_known_option(30))
+
+@test
+fn test_an_unknown_option_keeps_its_bytes_rather_than_being_dropped() [io]
+    // Multipath TCP is kind 30.  Traffic using an option newer than
+    // this package must still be readable, and a rewriter must be able
+    // to copy it forward.
+    let seg = bytes.from_byte_list(
+        [0x04, 0xD2, 0x00, 0x50, 0x00, 0x00, 0x03, 0xE8,
+         0x00, 0x00, 0x00, 0x00, 0x60, 0x02, 0xFF, 0xFF,
+         0x00, 0x00, 0x00, 0x00,
+         0x1E, 0x04, 0xDE, 0xAD])
+
+    test.case("it walks, and its data span is its payload")
+    match pkttcp.parse(seg, pktspan.whole(seg))
+        Ok(t)  =>
+            match pkttcp.options(seg, t)
+                Ok(os) =>
+                    match list.first(os)
+                        Some(o) =>
+                            match pkttcp.tcp_option_kind(seg, o)
+                                Ok(k)  => test.assert(k == 30)
+                                Err(_) => test.fail("kind 30 is multipath TCP")
+                            match pkttcp.tcp_option_data_span(seg, o)
+                                Ok(d)  => test.assert(d.len == 2)
+                                Err(_) => test.fail("its two data bytes are kept")
+                        None    => test.fail("one option is present")
+                Err(_) => test.fail("an unknown option still walks")
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+@test
+fn test_a_length_byte_of_one_is_refused_rather_than_looped_on() [io]
+    // A walk that accepted it would stand still, which is an infinite
+    // loop from a segment anybody can send.
+    let bad = bytes.from_byte_list(
+        [0x04, 0xD2, 0x00, 0x50, 0x00, 0x00, 0x03, 0xE8,
+         0x00, 0x00, 0x00, 0x00, 0x60, 0x02, 0xFF, 0xFF,
+         0x00, 0x00, 0x00, 0x00,
+         0x08, 0x01, 0x00, 0x00])
+
+    test.case("PktBadOption, naming the kind")
+    match pkttcp.parse(bad, pktspan.whole(bad))
+        Ok(t)  =>
+            match pkttcp.options(bad, t)
+                Ok(_)                   => test.fail("a length of 1 cannot advance a walk")
+                Err(PktBadOption(k, _)) => test.assert(k == 8)
+                Err(_)                  => test.fail("wrong reason for a length of 1")
+        Err(_) => test.fail("the fixture is a well-formed segment")
+
+@test
+fn test_padding_an_option_area_to_a_word() [io]
+    // The data offset counts thirty-two-bit words, so six bytes of
+    // options cannot be expressed.
+    test.case("six bytes pad to eight")
+    test.assert(bytes.len(pkttcp.pad_options(bytes.zeros(6))) == 8)
+
+    test.case("and four are left alone")
+    test.assert(bytes.len(pkttcp.pad_options(bytes.zeros(4))) == 4)

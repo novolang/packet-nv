@@ -1,0 +1,189 @@
+// pkterror.nv — every way a header can be refused, and the one
+// division that matters when the bytes came from a capture.
+//
+// TRUNCATED IS NOT MALFORMED
+//
+// A capture is taken with a snapshot length: tcpdump's default was
+// once 68 bytes and is now 262144, and a ring buffer on a busy link is
+// often set to 96 so that only the headers are stored.  Every packet
+// longer than the snapshot length arrives with its tail missing.  That
+// is the normal state of a capture file, not a fault in the packet,
+// and a tool that counted those as malformed would report a healthy
+// network as broken.
+//
+// So `PktTruncated` is one reason and `PktBadLength`, `PktBadVersion`
+// and `PktBadOption` are others, and `is_truncation` is the predicate
+// that separates "the capture did not keep this" from "what was kept
+// contradicts the specification".  The first is a fact about the
+// recording, the second is a fact about the wire.
+//
+// WHAT A REASON CARRIES
+//
+// Every arm carries the numbers a message needs, because the useful
+// line is "IPv4 header says 20 bytes and 14 are present" and a caller
+// cannot compute it from a reason that carries neither.  The layer is
+// a `Str` rather than a type, so that a reason crossing module
+// boundaries does not need every module's type in scope.
+
+// Why a header could not be read, or could not be built.
+//
+// ```novo
+// use pkterror
+//
+// fn main() [io]
+//     println(PktTruncated("ipv4", 20, 14).message())
+// ```
+pub enum PktError
+    // The bytes the header needs are not all present.  `layer` names
+    // which header was being read — `"ethernet"`, `"ipv4"`, `"tcp"` —
+    // `need` is how many bytes it required and `have` is how many the
+    // span held.  THE ORDINARY REASON IN A CAPTURE: a snapshot length
+    // cut the packet, and the recording is at fault rather than the
+    // packet.  `is_truncation` is true of this arm and of no other.
+    PktTruncated(layer: Str, need: Int, have: Int)
+    // A length field contradicts the specification or the bytes around
+    // it.  `field` names it — `"ihl"`, `"total_length"`,
+    // `"data_offset"`, `"udp_length"` — and `value` is what it said.
+    // An IPv4 header whose IHL is 4 and a UDP header whose length is 7
+    // land here; both are shorter than the header they measure.
+    PktBadLength(field: Str, value: Int)
+    // The version nibble is not the one this header must carry: 4 for
+    // IPv4 (RFC 791 section 3.1) and 6 for IPv6 (RFC 8200 section 3).
+    // Reading an IPv6 datagram with the IPv4 parser arrives here
+    // rather than producing a header of nonsense.
+    PktBadVersion(want: Int, got: Int)
+    // An option could not be walked.  `kind` is the option's type byte
+    // and `why` says what was wrong with it.  The common cases are a
+    // length byte of 0 or 1, which would make the walk stand still or
+    // go backwards, and a length that runs past the end of the option
+    // area.  Both are how an option walk becomes an infinite loop.
+    PktBadOption(kind: Int, why: Str)
+    // An ARP packet's address lengths do not match the pair of address
+    // families it names.  `hlen` and `plen` are the two length bytes.
+    // RFC 826 lets them be anything, so `sender_ipv4` refuses a packet
+    // whose protocol length is not 4 rather than reading four bytes of
+    // something else as an address.
+    PktBadArpShape(hlen: Int, plen: Int)
+    // The IPv6 extension-header chain has more headers than
+    // `pktipv6.extension_limit` allows.  A chain can be made
+    // arbitrarily long out of empty destination-options headers, which
+    // is a denial of service against any walker with no bound, so the
+    // walk has one and says when it hit it.
+    PktExtChainTooLong(count: Int, max: Int)
+    // A span does not fit the buffer it was used with.  `off` and
+    // `len` are the span, `buf_len` is the buffer's length.  THIS IS
+    // THE SPAN MISTAKE: a span cut from one buffer was read against a
+    // different one.  A span carries no reference to its buffer, so
+    // this is the only place the mismatch can be caught.
+    PktSpanOutOfRange(off: Int, len: Int, buf_len: Int)
+    // The header asked for is not what this packet carries.  `want` is
+    // the layer asked for and `got` names what the chain actually ends
+    // at.  Asking for the TCP header of a UDP datagram lands here.
+    PktNoSuchLayer(want: Str, got: Str)
+    // A checksum in the packet does not match the one computed over
+    // the bytes it covers.  `want` is the computed value and `got` is
+    // the one the packet carried.  Only the parse functions that
+    // verify use this reason; the ordinary ones answer a
+    // `PktChecksum`, which has four cases where this has one.
+    PktBadChecksum(want: Int, got: Int)
+    // A value handed to a builder does not fit its field.  `field`
+    // names it, `value` is what was given and `max` is the largest the
+    // field holds.  A VLAN identifier of 4096 in a twelve-bit field
+    // and a TTL of 300 in an eight-bit one both land here, rather than
+    // being silently truncated into a packet that means something
+    // else.
+    PktFieldOutOfRange(field: Str, value: Int, max: Int)
+
+// `PktError` is an `Error`, which is what lets `Result<T, PktError>`
+// exist at all (SPEC section 3.4).
+impl Error for PktError
+    // The one-line message, for a log or a capture tool's status
+    // column.
+    //
+    // It names the layer and the numbers: "ipv4: header needs 20 bytes
+    // and 14 are present", "tcp option 8: length 4 is shorter than the
+    // option it measures".  A reader diagnosing a capture needs the
+    // numbers, and a reason that printed only "malformed packet" would
+    // send them to a hex dump.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("packet-nv.PktError.message")
+
+// Whether this reason means the capture did not keep the bytes, rather
+// than that the bytes are wrong.
+//
+// True for `PktTruncated` and for nothing else.  A capture taken with
+// a snapshot length of 96 bytes truncates every full-sized frame, so a
+// tool that counted truncation as corruption would report a working
+// link as broken.  Counting the two separately is the difference
+// between "raise the snapshot length" and "something on this segment
+// is emitting bad packets".
+//
+// ```novo
+// use pkterror
+//
+// fn main() [io]
+//     println("${pkterror.is_truncation(PktTruncated("tcp", 20, 12))}")
+//     println("${pkterror.is_truncation(PktBadVersion(4, 6))}")
+// ```
+pub fn is_truncation(e: PktError) -> Bool
+    todo("packet-nv.pkterror.is_truncation")
+
+// Whether this reason means the bytes contradict the specification.
+//
+// True for `PktBadLength`, `PktBadVersion`, `PktBadOption`,
+// `PktBadArpShape` and `PktBadChecksum` — the reasons that describe
+// what was on the wire.  False for `PktTruncated`, which describes the
+// recording, and false for `PktSpanOutOfRange`,
+// `PktFieldOutOfRange` and `PktNoSuchLayer`, which describe the
+// calling program.
+//
+// The three groups have three different responses: fix the capture,
+// investigate the sender, fix the caller.
+//
+// ```novo
+// use pkterror
+//
+// fn main() [io]
+//     println("${pkterror.is_malformed(PktBadOption(8, "length 1"))}")
+//     println("${pkterror.is_malformed(PktSpanOutOfRange(0, 64, 40))}")
+// ```
+pub fn is_malformed(e: PktError) -> Bool
+    todo("packet-nv.pkterror.is_malformed")
+
+// Whether this reason means the CALLER made the mistake.
+//
+// True for `PktSpanOutOfRange`, `PktNoSuchLayer` and
+// `PktFieldOutOfRange`.  None of the three can be produced by any
+// packet: they mean a span was read against the wrong buffer, a header
+// was asked for that this packet does not carry, or a builder was
+// handed a value its field cannot hold.  A tool that logged them
+// beside the packet faults would be logging its own bugs as network
+// events.
+//
+// ```novo
+// use pkterror
+//
+// fn main() [io]
+//     println("${pkterror.is_caller_fault(PktNoSuchLayer("tcp", "udp"))}")
+// ```
+pub fn is_caller_fault(e: PktError) -> Bool
+    todo("packet-nv.pkterror.is_caller_fault")
+
+// A short stable code for a metric label or a counter: `"truncated"`,
+// `"bad_length"`, `"bad_option"`, and so on.
+//
+// Stable across releases and free of anything a packet carried, so it
+// is safe as a label.  Putting `e.message()` in one would put an
+// attacker-chosen length into a time series database, which is an
+// unbounded number of series from a single crafted packet.
+//
+// ```novo
+// use pkterror
+//
+// fn main() [io]
+//     println(pkterror.code(PktTruncated("ipv6", 40, 20)))
+// ```
+pub fn code(e: PktError) -> Str
+    todo("packet-nv.pkterror.code")

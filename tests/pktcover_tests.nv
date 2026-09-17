@@ -1,0 +1,252 @@
+// pktcover_tests.nv — the rest of the public surface, one case each.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches `not
+// implemented: packet-nv.<module>.<fn>`.
+//
+// The suites beside this one assert the DESIGN — the span, the option
+// walks, the extension chain, the checksum verdict.  This one exists so
+// that no public function ships without a written expectation of what
+// it answers: the protocol numbering, the VLAN tag's four fields, the
+// IPv4 option type byte's three, and the four TCP options a modern
+// connection negotiates.
+
+use std.test
+use std.bytes
+use pktspan
+use pktproto
+use pktether
+use pktipv4
+use pkttcp
+
+// A frame with one 802.1Q tag: broadcast destination, a source
+// address, tag protocol identifier 0x8100, priority 5, drop-eligible
+// set, identifier 100, then the IPv4 ethertype.
+fn tagged() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+        bytes.from_byte_list([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        bytes.from_byte_list([0x81, 0x00, 0xB0, 0x64]),
+        bytes.from_byte_list([0x08, 0x00]),
+        bytes.zeros(42)])
+
+// An IPv4 header with an internet header length of 6: twenty fixed
+// bytes and one four-byte option — a router alert (RFC 2113), whose
+// type byte 0x94 has the copied bit set, class 0 and number 20.
+fn with_option() -> Bytes
+    bytes.concat([
+        bytes.from_byte_list([0x46, 0x00, 0x00, 0x20, 0x1C, 0x46, 0x40, 0x00,
+                              0x40, 0x11, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01,
+                              0x0A, 0x00, 0x00, 0x02]),
+        bytes.from_byte_list([0x94, 0x04, 0x00, 0x00]),
+        bytes.from_byte_list([0x04, 0xD2, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00])])
+
+// A SYN carrying window scale 7, SACK-permitted, timestamps and one
+// SACK block, so that each typed option reader has something to read.
+fn options_syn() -> Bytes
+    bytes.from_byte_list(
+        [0x04, 0xD2, 0x00, 0x50, 0x00, 0x00, 0x03, 0xE8,
+         0x00, 0x00, 0x03, 0xE9, 0xC0, 0x12, 0xFF, 0xFF,
+         0x00, 0x00, 0x00, 0x00,
+         0x03, 0x03, 0x07,
+         0x04, 0x02,
+         0x08, 0x0A, 0x00, 0x00, 0x30, 0x39, 0x00, 0x00, 0x13, 0x88,
+         0x05, 0x0A, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x07, 0xD0,
+         0x00, 0x00])
+
+@test
+fn test_one_numbering_serves_both_ip_versions() [io]
+    // RFC 8200 section 3 says the next-header field uses the IPv4
+    // protocol numbers, which is why one enum serves both.
+    test.case("the numbers round-trip")
+    test.assert(pktproto.protocol_number(pktproto.protocol_of(6)) == 6)
+    test.assert(pktproto.protocol_number(PktProtoUdp) == 17)
+    test.assert(pktproto.protocol_number(PktProtoIcmpv6) == 58)
+
+    test.case("an unregistered number keeps itself")
+    match pktproto.protocol_of(132)
+        PktProtoOther(n) => test.assert(n == 132)
+        _                => test.fail("132 is SCTP, which this package has no arm for")
+
+    test.case("and a name is never blank")
+    test.assert(pktproto.protocol_name(PktProtoTcp) == "tcp")
+    test.assert(pktproto.protocol_name(PktProtoOther(89)) == "89")
+
+@test
+fn test_the_walks_stop_condition_is_six_values_and_not_seven() [io]
+    // 59 ends the chain WITHOUT being a header: whatever follows is not
+    // a header of any kind.  A walker that treated it as an unknown
+    // upper layer would hand the padding to a TCP parser.
+    test.case("the six extension headers")
+    test.assert(pktproto.is_extension_header(PktProtoIpv6HopByHop))
+    test.assert(pktproto.is_extension_header(PktProtoIpv6Route))
+    test.assert(pktproto.is_extension_header(PktProtoIpv6Frag))
+    test.assert(pktproto.is_extension_header(PktProtoIpv6Dest))
+    test.assert(pktproto.is_extension_header(PktProtoAh))
+    test.assert(pktproto.is_extension_header(PktProtoEsp))
+
+    test.case("59 is not one of them")
+    test.assert(not pktproto.is_extension_header(PktProtoIpv6NoNext))
+
+    test.case("and neither is a transport protocol")
+    test.assert(not pktproto.is_extension_header(PktProtoTcp))
+
+    test.case("ICMPv6 is the one protocol whose checksum is always pseudo-covered")
+    test.assert(pktproto.needs_pseudo_header(PktProtoIcmpv6))
+    test.assert(not pktproto.needs_pseudo_header(PktProtoIcmp))
+
+@test
+fn test_a_vlan_tag_is_four_fields_in_four_bytes() [io]
+    let f = tagged()
+    match pktether.parse(f, pktspan.whole(f))
+        Ok(e)  =>
+            test.assert(pktether.tag_count(e) == 1)
+            match pktether.vlan(f, e, 0)
+                Ok(v)  =>
+                    test.case("the tag protocol identifier says which standard")
+                    match pktether.vlan_tpid(f, v)
+                        Ok(t)  => test.assert(t == 0x8100)
+                        Err(_) => test.fail("the fixture carries an 802.1Q tag")
+
+                    test.case("the priority is the top three bits")
+                    match pktether.vlan_priority(f, v)
+                        Ok(p)  => test.assert(p == 5)
+                        Err(_) => test.fail("the fixture says 5")
+
+                    test.case("the drop-eligible bit is the one below them")
+                    match pktether.vlan_drop_eligible(f, v)
+                        Ok(d)  => test.assert(d)
+                        Err(_) => test.fail("the fixture sets it")
+
+                    test.case("the identifier is the low twelve bits")
+                    match pktether.vlan_id(f, v)
+                        Ok(i)  => test.assert(i == 100)
+                        Err(_) => test.fail("the fixture says 100")
+
+                    test.case("and a parsed tag crosses to the build side unchanged")
+                    match pktether.vlan_tag_of(f, v)
+                        Ok(t)  =>
+                            test.assert(t.tpid == 0x8100)
+                            test.assert(t.priority == 5)
+                            test.assert(t.drop_eligible)
+                            test.assert(t.id == 100)
+                        Err(_) => test.fail("a parsed tag has four fields")
+
+                Err(_) => test.fail("the fixture carries one tag")
+
+        Err(_) => test.fail("the fixture is a well-formed frame")
+
+@test
+fn test_an_ipv4_option_type_byte_is_three_fields() [io]
+    // RFC 791 section 3.1.  A router alert is number 20 with the copied
+    // bit set, so the byte is 0x94 and a program comparing the whole
+    // byte against 20 never finds it.
+    let d = with_option()
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            test.case("an internet header length of 6 leaves four bytes of options")
+            test.assert(h.options.len == 4)
+
+            match pktipv4.options(d, h)
+                Ok(os) =>
+                    test.assert(list.len(os) == 1)
+                    match list.first(os)
+                        Some(o) =>
+                            test.case("the whole byte is 0x94")
+                            match pktipv4.option_kind(d, o)
+                                Ok(k)  => test.assert(k == 0x94)
+                                Err(_) => test.fail("the fixture carries a router alert")
+
+                            test.case("the number is 20, and that is what a filter compares")
+                            match pktipv4.option_number(d, o)
+                                Ok(n)  => test.assert(n == 20)
+                                Err(_) => test.fail("a router alert is number 20")
+
+                            test.case("the class is 0, control")
+                            match pktipv4.option_class(d, o)
+                                Ok(c)  => test.assert(c == 0)
+                                Err(_) => test.fail("a router alert is a control option")
+
+                            test.case("the copied bit is set, so a fragmenter carries it forward")
+                            match pktipv4.option_is_copied(d, o)
+                                Ok(c)  => test.assert(c)
+                                Err(_) => test.fail("0x94 has bit 7 set")
+
+                            test.case("the length counts the type and length bytes")
+                            match pktipv4.option_length(d, o)
+                                Ok(n)  => test.assert(n == 4)
+                                Err(_) => test.fail("the fixture says 4")
+
+                            test.case("and the data is what is left")
+                            match pktipv4.option_data_span(d, o)
+                                Ok(s)  => test.assert(s.len == 2)
+                                Err(_) => test.fail("four bytes less two is two")
+
+                        None    => test.fail("the fixture carries one option")
+
+                Err(_) => test.fail("the fixture's options walk")
+
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_two_checksum_entry_points_on_an_ipv4_header() [io]
+    test.case("`parse_verified` refuses a header whose checksum is wrong")
+    let d = with_option()
+    match pktipv4.parse_verified(d, pktspan.whole(d))
+        Ok(_)                     => test.assert(true)
+        Err(PktBadChecksum(_, g)) => test.assert(g == 0)
+        Err(_)                    => test.fail("the fixture is well formed apart from its checksum")
+
+    test.case("and `set_checksum` writes one a verifier will accept")
+    match pktipv4.parse(d, pktspan.whole(d))
+        Ok(h)  =>
+            match pktipv4.set_checksum(d, h)
+                Ok(b)  => test.assert(bytes.len(b) == bytes.len(d))
+                Err(_) => test.fail("the whole header is present")
+        Err(_) => test.fail("the fixture is a well-formed datagram")
+
+@test
+fn test_the_four_tcp_options_a_modern_connection_negotiates() [io]
+    let s = options_syn()
+    match pkttcp.parse(s, pktspan.whole(s))
+        Ok(t)  =>
+            match pkttcp.options(s, t)
+                Ok(os) =>
+                    test.case("window scale, SACK-permitted, timestamps and a SACK block")
+                    test.assert(list.len(os) >= 4)
+
+                    test.case("the shift is the PEER's and applies after the handshake")
+                    let scale = list.get(os, 0)
+                    match pkttcp.window_scale(s, scale)
+                        Ok(n)  => test.assert(n == 7)
+                        Err(_) => test.fail("the fixture announces a shift of 7")
+
+                    test.case("SACK-permitted is two bytes and carries no data")
+                    let permitted = list.get(os, 1)
+                    match pkttcp.sack_permitted(s, permitted)
+                        Ok(b)  => test.assert(b)
+                        Err(_) => test.fail("the fixture carries kind 4")
+
+                    test.case("a timestamp is meaningful only against the same sender's")
+                    let stamps = list.get(os, 2)
+                    match pkttcp.timestamp_value(s, stamps)
+                        Ok(v)  => test.assert(v == 0x3039)
+                        Err(_) => test.fail("the fixture carries a timestamp")
+                    match pkttcp.timestamp_echo(s, stamps)
+                        Ok(v)  => test.assert(v == 0x1388)
+                        Err(_) => test.fail("the fixture carries an echo reply")
+
+                    test.case("and a SACK block is a HALF-OPEN range")
+                    let sack = list.get(os, 3)
+                    match pkttcp.sack_blocks(s, sack)
+                        Ok(bs) =>
+                            test.assert(list.len(bs) == 1)
+                            match list.first(bs)
+                                Some(b) =>
+                                    test.assert(b.left == 1000)
+                                    test.assert(b.right == 2000)
+                                None    => test.fail("the fixture carries one block")
+                        Err(_) => test.fail("the fixture carries kind 5")
+
+                Err(_) => test.fail("the fixture's options walk")
+
+        Err(_) => test.fail("the fixture is a well-formed segment")
