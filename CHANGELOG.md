@@ -5,6 +5,15 @@ All notable changes to packet-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-25
+
+The package builds with novo 0.11.  Every body is still `todo()`.
+
+- The lock file moves ipaddr-nv 0.1.2 to 0.1.4.  ipaddr-nv 0.1.2 writes
+  into lists through names that are not declared `var`, which novo 0.11
+  refuses (E2038), so this package did not build with novo 0.11 against
+  it.  No requirement in the manifest changed.
+
 ## 0.0.2 — 2026-09-25
 
 One test changed so that it builds with novo 0.10.0.  A `Bytes` buffer is
