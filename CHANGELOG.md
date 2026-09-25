@@ -5,6 +5,14 @@ All notable changes to packet-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-25
+
+One test changed so that it builds with novo 0.10.0.  A `Bytes` buffer is
+now written in place, and a write goes through a name declared `var`.  The
+fragment test copies the whole datagram with `bytes.clone` and sets the
+fragment field in the copy, so the original datagram keeps its value.  No
+signature changed, and every body is still `todo()`.
+
 ## 0.0.1 — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public

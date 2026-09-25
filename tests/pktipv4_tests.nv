@@ -142,7 +142,8 @@ fn test_both_fragment_bits_are_needed_and_the_offset_is_in_bytes() [io]
     test.case("the offset is multiplied by eight, because the field counts eights")
     // Flags and fragment offset 0x00B9: more-fragments set, offset 185
     // eight-byte units, which is 1480 bytes.
-    let frag = bytes.set_u16_be(d, 6, 0x20B9)
+    var frag = bytes.clone(d)
+    bytes.set_u16_be(frag, 6, 0x20B9)
     match pktipv4.parse(frag, pktspan.whole(frag))
         Ok(h)  =>
             match pktipv4.fragment_offset(frag, h)

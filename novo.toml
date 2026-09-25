@@ -1,6 +1,6 @@
 [package]
 name        = "packet-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Ethernet, ARP, IPv4, IPv6, ICMP, ICMPv6, TCP and UDP headers read as spans over bytes the caller already holds — an offset and a length, never a copy — with the IPv4 option list and the IPv6 extension-header chain walked rather than skipped, the TCP options decoded, and every checksum computed and verified over its pseudo-header.  The analysis half of a protocol stack, with no sockets and no reassembly."
 license     = "Apache-2.0"
 
